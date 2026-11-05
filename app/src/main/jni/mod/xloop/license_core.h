@@ -75,6 +75,11 @@ inline void Log(const char* fmt, ...) {
     va_end(ap);
 }
 
+inline bool FileExists(const char* path) {
+    struct stat st;
+    return path && stat(path, &st) == 0;
+}
+
 inline std::string HttpUserAgent() {
     return std::string("FiturinEngine/") + XLOOP_TOOL_VERSION + " (Android; XLOOP license client)";
 }
@@ -318,7 +323,31 @@ inline std::string RandomNonce() {
             buf[i] = (unsigned char)(s >> 33);
         }
     }
-    return Base64UrlEncode(buf, sizeof(buf));
+    std::string nonce = Base64UrlEncode(buf, sizeof(buf));
+
+    // Pagar pengaman: nonce harus bersih dari karakter yang bikin masalah.
+    // (Pernah kejadian base64 acak menghasilkan sesuatu yang mirip hostname,
+    //  contohnya "....172-..." yang lalu dianggap alamat oleh resolver.)
+    bool dirty = nonce.find('.') != std::string::npos;
+    if (!dirty) {
+        static const char* hosts[] = {"http", "https", "www", "localhost", "vercel", "api"};
+        std::string lower = nonce;
+        ToLowerInPlace(lower);
+        for (const char* h : hosts) {
+            if (lower.find(h) != std::string::npos) { dirty = true; break; }
+        }
+    }
+    if (dirty) {
+        // ganti dengan nonce hex (hanya 0-9a-f): tidak mungkin mirip hostname
+        static const char* hex = "0123456789abcdef";
+        nonce.clear();
+        nonce.reserve(sizeof(buf) * 2);
+        for (size_t i = 0; i < sizeof(buf); ++i) {
+            nonce.push_back(hex[buf[i] >> 4]);
+            nonce.push_back(hex[buf[i] & 0xF]);
+        }
+    }
+    return nonce;
 }
 
 // ---------------------------- hardware id ----------------------------
@@ -415,6 +444,12 @@ inline std::string HardwareId() {
 // ---------------------------- storage ----------------------------
 inline std::string StorageDir() {
     std::string pkg = ReadFileString("/proc/self/cmdline", 200);
+    // /proc/self/cmdline dipisah NUL dan sering berakhiran NUL -> harus dipotong,
+    // kalau tidak path direktori jadi tidak valid dan session lisensi tidak
+    // pernah tersimpan (key harus ditempel ulang tiap buka game).
+    size_t nul = pkg.find('\0');
+    if (nul != std::string::npos) pkg.resize(nul);
+    pkg = Trim(pkg);
     if (pkg.empty()) pkg = "com.miniclip.eightballpool";
     std::string dir = "/data/user_de/0/" + pkg + "/no_backup/xloop";
     return dir;
@@ -597,6 +632,8 @@ struct Result {
     int currentDevices = 0;
     std::string secret;         // secret_payload dari panel (hanya di memori)
     bool cached = false;        // true kalau hasil dari session offline
+    int  httpCode = 0;          // 0 = request tidak pernah sampai (lihat httpError)
+    std::string httpError;      // pesan transport curl ("" kalau tidak ada error)
 };
 
 inline std::string ReasonMessage(Reason r, const std::string& extra = "") {
@@ -663,13 +700,21 @@ inline std::string FormatEpoch(int64_t ts) {
     return std::string(buf);
 }
 
+
 // ---------------------------- HTTP ----------------------------
 // Timeout pendek supaya UI tidak "nyangkut" saat server lambat.
-inline bool PostJson(const std::string& url, const std::string& body, std::string& out, long& httpCode) {
+inline bool PostJson(const std::string& url, const std::string& body, std::string& out, long& httpCode,
+                     std::string* transportError = nullptr, int* curlCode = nullptr) {
     out.clear();
     httpCode = 0;
+    if (transportError) transportError->clear();
+    if (curlCode) *curlCode = 0;
     CURL* curl = curl_easy_init();
-    if (!curl) return false;
+    if (!curl) {
+        if (transportError) *transportError = "curl_easy_init gagal";
+        Log("curl_easy_init gagal (libcurl static tidak ter-load?)");
+        return false;
+    }
 
     struct curl_slist* headers = nullptr;
     headers = curl_slist_append(headers, "Content-Type: application/json");
@@ -688,13 +733,83 @@ inline bool PostJson(const std::string& url, const std::string& body, std::strin
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
     curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
+    // libcurl 7.51 di build ini tidak punya CA bundle bawaan; hormati env
+    // CURL_CA_BUNDLE / SSL_CERT_FILE kalau diset (berguna untuk testing).
+    // Urutan: env (untuk testing) -> bundle sistem Android -> empty string
+    // (biarkan libcurl/OpenSSL pakai default CApath /etc/ssl/certs).
+    const char* caBundle = getenv("CURL_CA_BUNDLE");
+    if (!caBundle || !*caBundle) caBundle = getenv("SSL_CERT_FILE");
+    if ((!caBundle || !*caBundle) && FileExists("/system/etc/security/cacerts"))
+        caBundle = "/system/etc/security/cacerts";     // dir default Android
+    if (caBundle && *caBundle) curl_easy_setopt(curl, CURLOPT_CAINFO, caBundle);
+    curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "");   // gzip: respons tetap terbaca
+    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
 
     CURLcode res = curl_easy_perform(curl);
     if (res == CURLE_OK) curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &httpCode);
 
+    if (res != CURLE_OK) {
+        std::string err = curl_easy_strerror(res);
+        char codeBuf[16];
+        snprintf(codeBuf, sizeof(codeBuf), "%d", (int)res);
+        // Detail lengkap hanya ke log: di kartu user cukup pesan ramah.
+        Log("http transport gagal: url=%s curl=%d(%s) %s", url.c_str(), (int)res, codeBuf, err.c_str());
+        if (transportError) *transportError = err;
+        if (curlCode) *curlCode = (int)res;
+    }
+
     curl_slist_free_all(headers);
     curl_easy_cleanup(curl);
     return res == CURLE_OK;
+}
+
+// ============================ DIAGNOSA ============================
+// Dipakai untuk membedakan tiga penyebab "Koneksi bermasalah":
+//   1. device memang tanpa internet / DNS gagal  -> curl 6/7
+//   2. server menolak / redirect aneh             -> http code
+//   3. TLS/CA tidak bisa diverifikasi             -> curl 60/77/83
+// Hasil lengkap selalu ditulis ke log XLOOP (adb logcat -s XLOOP).
+struct Diagnostics {
+    bool reached   = false;   // server bisa dihubungi & menjawab HTTP
+    long httpCode  = 0;
+    int  curlCode  = 0;
+    const char* stage = "connect";   // connect | tls | http
+};
+
+inline std::string PanelUrl() {
+    std::string url = Trim(XLOOP_PANEL_URL);
+    while (!url.empty() && url.back() == '/') url.pop_back();
+    return url;
+}
+
+inline std::string ValidateUrl() { return PanelUrl() + "/api/validate"; }
+
+// GET ringan ke {panel}/api/health kalau ada, atau /api/validate (POST kosong).
+inline Diagnostics RunDiagnostics() {
+    Diagnostics d;
+    std::string out;
+    long httpCode = 0;
+    std::string transportError;
+    int curlCode = 0;
+
+    Log("diag: libcurl+openssl build, url=%s, tool=%s v=%s",
+        ValidateUrl().c_str(), XLOOP_TOOL_SLUG, XLOOP_TOOL_VERSION);
+
+    // POST dengan body minimal: endpoint asli, jadi hasilnya representatif.
+    std::string body = "{\"key\":\"\",\"tool_slug\":\"" + std::string(XLOOP_TOOL_SLUG) + "\"}";
+    bool ok = PostJson(ValidateUrl(), body, out, httpCode, &transportError, &curlCode);
+    d.httpCode = httpCode;
+    d.curlCode = curlCode;
+    d.reached = ok;
+    if (!ok) {
+        d.stage = (curlCode == 60 || curlCode == 77 || curlCode == 83 || curlCode == 51) ? "tls" : "connect";
+        Log("diag hasil: stage=%s curl=%d %s", d.stage, curlCode, transportError.c_str());
+    } else {
+        d.stage = "http";
+        Log("diag hasil: HTTP %ld, body=%s", httpCode,
+            out.size() > 160 ? (out.substr(0, 160) + "...").c_str() : out.c_str());
+    }
+    return d;
 }
 
 // ---------------------------- verifikasi ----------------------------
@@ -863,20 +978,29 @@ inline Result VerifyKey(const std::string& rawKey) {
     req["hardware_id"] = hwid;
     req["nonce"] = nonce;
 
-    std::string url = Trim(XLOOP_PANEL_URL);
-    while (!url.empty() && url.back() == '/') url.pop_back();
-    url += "/api/validate";
+    std::string url = ValidateUrl();
 
     std::string response;
     long httpCode = 0;
-    if (!PostJson(url, req.dump(), response, httpCode)) {
+    std::string transportError;
+    int curlCode = 0;
+    Log("validate -> %s (tool=%s v=%s)", url.c_str(), XLOOP_TOOL_SLUG, XLOOP_TOOL_VERSION);
+    if (!PostJson(url, req.dump(), response, httpCode, &transportError, &curlCode)) {
         r.reason = Reason::Network;
         r.message = ReasonMessage(r.reason);
+        r.httpError = transportError + " (" + std::to_string(curlCode) + ")";
+        // curl 60/51/58/35/77/83 = masalah TLS / sertifikat CA, bukan jaringan user.
+        if (curlCode == 60 || curlCode == 51 || curlCode == 58 || curlCode == 35 ||
+            curlCode == 77 || curlCode == 83 || curlCode == 90 || curlCode == 91) {
+            Log("TLS/CA gagal (curl %d): %s", curlCode, transportError.c_str());
+        }
         return r;
     }
+    r.httpCode = (int)httpCode;
     if (response.empty()) {
         r.reason = (httpCode == 429) ? Reason::RateLimited : Reason::Network;
         r.message = ReasonMessage(r.reason);
+        Log("response kosong, http=%ld", httpCode);
         return r;
     }
     if (httpCode == 429) {
@@ -886,12 +1010,14 @@ inline Result VerifyKey(const std::string& rawKey) {
     }
 
     r = VerifyServerResponse(response, key, nonce, hwid);
+    r.httpCode = (int)httpCode;
     if (r.ok) {
         Log("license ok, expires=%s devices=%d/%d",
             r.expiredEpoch ? FormatEpoch(r.expiredEpoch).c_str() : "lifetime",
             r.currentDevices, r.maxDevice);
     } else {
-        Log("license failed: %s", r.message.c_str());
+        Log("license failed: %s (http=%ld body=%s)", r.message.c_str(), httpCode,
+            response.size() > 220 ? (response.substr(0, 220) + "...").c_str() : response.c_str());
     }
     return r;
 }
