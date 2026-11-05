@@ -5,6 +5,7 @@ bool bTouchBlocked = false;
 extern bool isTouchLockedByBot();
 
 #include "java.h"
+#include "mod/xloop/auth_ui.h"   // xloop::OnRawTouch() untuk tap kartu login
 
 DEFINES(void, nativeTouchesBegin, JNIEnv* env, jobject obj, jint i, float x, float y, jboolean isObscured, jboolean isPartiallyObscured) {
     // LOGI("nativeTouchesBegin %d %f %f %d %d", i, x, y, isObscured, isPartiallyObscured);
@@ -14,6 +15,10 @@ DEFINES(void, nativeTouchesBegin, JNIEnv* env, jobject obj, jint i, float x, flo
         ImGuiIO& io = ImGui::GetIO();
         io.MouseDown[i] = true;
         io.MousePos = ImVec2(x, y);
+
+        // Tap mentah untuk kartu login: tidak bergantung pada state mouse ImGui,
+        // jadi tombol PASTE / Masuk / mata tetap jalan di layar sentuh.
+        xloop::OnRawTouch(true, x, y);
 
         bTouchFromOutsideImGui = !IsPointOverAnyWindow({x, y});
         bTouchBlocked = bTouchFromOutsideImGui && isTouchLockedByBot();
@@ -31,7 +36,9 @@ DEFINES(void, nativeTouchesEnd, JNIEnv* env, jobject obj, jint i, float x, float
     if (i == 0) {
         ImGuiIO& io = ImGui::GetIO();
         io.MouseDown[i] = false;
-        
+
+        xloop::OnRawTouch(false, x, y);
+
         if (bTouchFromOutsideImGui) {
             bool blocked = bTouchBlocked;
             bTouchFromOutsideImGui = false;

@@ -52,7 +52,8 @@ struct AuthState {
     int64_t     expiredEpoch    = 0;
     int         maxDevice       = 0;
     int         currentDevices  = 0;
-    bool        wantFocusInput  = false;
+    bool        fieldFocused    = false;   // field key sedang dipilih (kursor)
+    bool        wantFocusInput  = false;   // kompat: sama dengan fieldFocused
     bool        showKey         = false;   // tombol mata
 };
 
@@ -194,6 +195,7 @@ inline void StartVerify(const std::string& rawKey, bool silent) {
         g_auth.lastReason = reason;
         g_auth.message = FriendlyMessage(reason);
         SetToast(g_auth.message, false);
+        g_auth.fieldFocused = true;
         g_auth.wantFocusInput = true;
     };
 
@@ -380,6 +382,114 @@ inline void CenterText(ImDrawList* dl, ImVec2 centerX, const char* text, ImU32 c
     dl->AddText(ImVec2(centerX.x - ts.x * 0.5f, centerX.y), col, text);
 }
 
+// ------------------------------------------------------------------
+// Tap handling khusus layar sentuh.
+//
+// Pola "hovered && io.MouseReleased[0]" TIDAK aman di Android: kalau jari
+// bergeser sedikit sebelum diangkat, item sudah tidak hovered lagi saat UP
+// sehingga tombol tidak pernah terpicu. Kalau jari digeser dan diangkat,
+// ImGui juga membatalkan klik. Akibatnya semua tombol terasa "mati".
+//
+// Karena itu tombol di kartu login memakai tap sendiri: catat posisi DOWN,
+// lalu saat UP terima tap kalau jaraknya masih di dalam toleransi (atau kalau
+// masih di dalam rect tombol). Down di luar tombol dan up di dalam tombol juga
+// diterima, supaya tap tetap responsif.
+// ------------------------------------------------------------------
+static ImVec2 g_tapDownPos    = ImVec2(-1.0f, -1.0f);
+static ImVec2 g_tapUpPos      = ImVec2(-1.0f, -1.0f);
+static int    g_tapUpFrame    = -1;
+static ImGuiID g_tapDownId    = 0;
+static int    g_tapLastFrame  = -1;
+static bool   g_tapUpPending  = false;   // UP dari jalur sentuhan mentah (input.h)
+static bool   g_tapDownIsRaw  = false;   // DOWN terakhir datang dari jalur mentah
+
+// ---------------------------------------------------------------
+// Jalur tap utama di Android TIDAK lewat state mouse ImGui.
+//
+// Hook sentuhan milik engine (include/input.h) memanggil OnRawTouch()
+// langsung dari nativeTouchesBegin/End, jadi tap tetap terbaca walau
+// state mouse/klik ImGui gagal terbentuk (posisi bergeser, klik
+// dibatalkan, window tidak menerima fokus, dsb). Ini yang bikin semua
+// tombol kartu login terasa mati sebelumnya.
+// ---------------------------------------------------------------
+inline void OnRawTouch(bool down, float x, float y) {
+    if (down) {
+        g_tapDownPos = ImVec2(x, y);
+        g_tapUpPos = ImVec2(-1.0f, -1.0f);
+        g_tapDownId = 0;
+        g_tapUpPending = false;
+        g_tapDownIsRaw = true;
+    } else {
+        g_tapUpPos = ImVec2(x, y);
+        g_tapUpPending = true;
+        g_tapDownPos = ImVec2(-1.0f, -1.0f);
+        g_tapDownIsRaw = false;
+    }
+}
+
+// Panggil sekali per frame, sebelum widget kartu digambar.
+inline void BeginTapFrame() {
+    ImGuiIO& io = ImGui::GetIO();
+    ImGuiContext& g = *GImGui;
+
+    if (g_tapUpPending) {                      // tap selesai lewat jalur mentah
+        g_tapUpFrame = g.FrameCount;
+        g_tapUpPending = false;
+        return;                                // jangan campur dengan state mouse ImGui
+    }
+    if (g_tapDownIsRaw) return;                 // masih dipegang lewat jalur mentah
+    if (g_tapLastFrame == g.FrameCount) return; // sudah diproses frame ini
+    g_tapLastFrame = g.FrameCount;
+
+    if (io.MouseDown[0]) {
+        if (g_tapDownPos.x < 0.0f) {            // DOWN baru (jalur ImGui)
+            g_tapDownPos = io.MousePos;
+            g_tapDownId = 0;
+            g_tapDownIsRaw = false;
+        }
+    } else if (g_tapDownPos.x >= 0.0f) {        // dilepas lewat jalur ImGui
+        if (g_tapUpFrame != g.FrameCount) {
+            g_tapUpPos = io.MousePos;
+            g_tapUpFrame = g.FrameCount;
+        }
+        // g_tapDownId sengaja tidak direset: TapInRect masih memakainya untuk
+        // memastikan DOWN memang mendarat di tombol yang sama.
+        g_tapDownPos = ImVec2(-1.0f, -1.0f);
+    }
+}
+
+// true kalau frame ini ada tap (DOWN lalu UP) yang berakhir di dalam rect.
+// Toleransi membuat tap tetap sah walau jari bergeser sedikit sebelum diangkat.
+inline bool TapInRect(ImGuiID id, const ImRect& bb, float tolerance = 0.0f) {
+    ImGuiIO& io = ImGui::GetIO();
+    ImGuiContext& g = *GImGui;
+
+    // Toleransi standar: 0.85 baris teks (jari tidak pernah presisi, tapi tetap
+    // tidak boleh "melebar" sampai menabrak tombol tetangga).
+    // tolerance < 0 -> pakai rect apa adanya (0 px).
+    const float tol = tolerance > 0.0f ? tolerance
+                    : (tolerance < 0.0f ? 0.0f : ImGui::GetTextLineHeight() * 0.85f);
+    ImRect hit(bb.Min - ImVec2(tol, tol), bb.Max + ImVec2(tol, tol));
+
+    // DOWN di dalam tombol -> tombol ini yang "dipegang".
+    // Cek g_tapDownPos saja (tidak bergantung io.MouseDown) supaya jalur
+    // sentuhan mentah juga tercatat.
+    if (g_tapDownPos.x >= 0.0f && g_tapDownId == 0 && hit.Contains(g_tapDownPos))
+        g_tapDownId = id;
+
+    if (g_tapUpFrame != g.FrameCount) return false;          // tidak ada UP di frame ini
+    if (!hit.Contains(g_tapUpPos)) return false;             // UP di luar tombol
+    // DOWN harus mendarat di tombol ini: mencegah tap "nyasar" dari area lain
+    // memicu tombol yang bukan dituju (mis. tap di luar kartu lalu jari bergeser).
+    if (g_tapDownId != id) return false;
+
+    // Satu tap hanya boleh memicu satu tombol: setelah dipakai, tap ditutup.
+    g_tapUpFrame = -1;
+    g_tapUpPos = ImVec2(-1.0f, -1.0f);
+    g_tapDownId = 0;
+    return true;
+}
+
 // Tombol custom bertema: accent = gold penuh, non-accent = glass gelap.
 inline bool ThemeButton(const char* id, const char* label, ImVec2 size, bool accent, bool disabled = false) {
     ImGuiWindow* window = ImGui::GetCurrentWindow();
@@ -396,6 +506,7 @@ inline bool ThemeButton(const char* id, const char* label, ImVec2 size, bool acc
     if (!disabled) ImGui::ButtonBehavior(bb, wid, &hovered, &held);
     LerpAnim(wid, (!disabled && (hovered || held)) ? 1.0f : 0.0f);
     float anim = AnimSlot(wid);
+    const bool tapped = !disabled && TapInRect(wid, bb);
 
     ImDrawList* dl = window->DrawList;
     float rounding = size.y * 0.30f;
@@ -428,7 +539,8 @@ inline bool ThemeButton(const char* id, const char* label, ImVec2 size, bool acc
     dl->AddText(ImVec2(XRound(bb.Min.x + (size.x - ts.x) * 0.5f), XRound(bb.Min.y + (size.y - ts.y) * 0.5f)),
                 textCol, label);
 
-    return hovered && !disabled && g.IO.MouseReleased[0];
+    (void)g;
+    return tapped;
 }
 
 // icon: 0 = mata, 1 = paste
@@ -445,6 +557,7 @@ inline bool CircleIconButton(const char* id, ImVec2 topLeft, float size, int ico
     if (!disabled) ImGui::ButtonBehavior(bb, wid, &hovered, &held);
     LerpAnim(wid, (!disabled && (hovered || held)) ? 1.0f : 0.0f);
     float anim = AnimSlot(wid);
+    const bool tapped = !disabled && TapInRect(wid, bb);
 
     ImDrawList* dl = window->DrawList;
     float radius = size * 0.5f;
@@ -477,7 +590,8 @@ inline bool CircleIconButton(const char* id, ImVec2 topLeft, float size, int ico
         dl->AddRect(ImVec2(center.x - r * 0.34f, center.y - r * 0.92f), ImVec2(center.x + r * 0.78f, center.y + r * 0.48f), col, 2.0f, 0, 1.5f);
     }
 
-    return hovered && !disabled && g.IO.MouseReleased[0];
+    (void)g;
+    return tapped;
 }
 
 inline void OpenUrl(const char* url) {
@@ -509,6 +623,7 @@ inline std::string ReadClipboard() {
 // Tidak ada istilah teknis (HWID, server, signature, format key) di layar.
 
 inline void DrawLoginUI(ImGuiIO& io) {
+    BeginTapFrame();
     float dt = io.DeltaTime;
     if (!g_auth.sessionLoaded) BootAuth();
     if (g_auth.toastTimer > 0.0f) g_auth.toastTimer -= dt;
@@ -557,14 +672,14 @@ inline void DrawLoginUI(ImGuiIO& io) {
         float gS2 = gapM * 0.90f;    // subjudul -> field
         float gN  = gapM * 0.85f;    // field/status -> tombol
         float gB  = gapS * 1.20f;    // tombol -> footer
-        float fullH = pH * 2.0f + lineH * 4.0f + gT + gS2 + gN + gB + fieldH + btnH;
+        float fullH = pH * 2.5f + lineH * 4.0f + gT + gS2 + gN + gB + fieldH + btnH;
         const float maxH = io.DisplaySize.y * 0.92f;
         if (fullH > maxH) {
             float k = ImMax(0.55f, maxH / fullH);
             pH = pH * k; gT = gT * k; gS2 = gS2 * k; gN = gN * k; gB = gB * k;
             fieldH = ImMax(lineH * 1.45f, fieldH * k);
             btnH   = ImMax(lineH * 1.45f, btnH * k);
-            fullH = pH * 2.0f + lineH * 4.0f + gT + gS2 + gN + gB + fieldH + btnH;
+            fullH = pH * 2.5f + lineH * 4.0f + gT + gS2 + gN + gB + fieldH + btnH;
         }
         const float cardH = XRound(ImMin(fullH, maxH));
 
@@ -624,42 +739,49 @@ inline void DrawLoginUI(ImGuiIO& io) {
                 inputW = ImGui::CalcTextSize("XLVP-XXXX-XXXX").x + padX;
 
             ImVec2 fMin(x, y), fMax(x + inputW, y + fieldH);
+            ImGuiID fieldId = ImGui::GetCurrentWindow()->GetID("##xloopKeyField");
+            bool fieldHovered = fMin.x <= io.MousePos.x && io.MousePos.x <= fMax.x &&
+                                fMin.y <= io.MousePos.y && io.MousePos.y <= fMax.y;
+            bool fieldActive = g_auth.fieldFocused;
+
+            // Field digambar manual: tidak memakai InputText supaya tidak butuh
+            // keyboard virtual / state fokus ImGui (yang sering tidak muncul di
+            // overlay game). Ketik manual tetap bisa lewat keyboard fisik;
+            // untuk layar sentuh cukup tombol PASTE.
             dl->AddRectFilled(fMin, fMax, XC_FIELD, 10.0f * scale);
-
-            ImGui::SetCursorScreenPos(ImVec2(fMin.x + padX * 0.55f, fMin.y + (fieldH - lineH) * 0.5f));
-            ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0, 0, 0, 0));
-            ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, ImVec4(0, 0, 0, 0));
-            ImGui::PushStyleColor(ImGuiCol_FrameBgActive, ImVec4(0, 0, 0, 0));
-            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.95f, 0.86f, 1.0f));
-            ImGui::PushStyleColor(ImGuiCol_TextDisabled, ImVec4(0.45f, 0.44f, 0.52f, 1.0f));
-            ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(0, 0));
-            ImGui::PushItemWidth(inputW - padX * 1.1f);
-
-            char buf[128];
-            snprintf(buf, sizeof(buf), "%s", g_auth.keyInput.c_str());
-            ImGuiInputTextFlags iflags = ImGuiInputTextFlags_CharsUppercase |
-                                         ImGuiInputTextFlags_AutoSelectAll |
-                                         ImGuiInputTextFlags_EnterReturnsTrue;
-            if (!g_auth.showKey) iflags |= ImGuiInputTextFlags_Password;
-            if (g_auth.wantFocusInput) { ImGui::SetKeyboardFocusHere(); g_auth.wantFocusInput = false; }
-
-            bool submitted = ImGui::InputTextWithHint("##xloopKeyField", "Tempel key di sini", buf, sizeof(buf), iflags);
-            bool fieldActive = ImGui::IsItemActive();
-            bool fieldHovered = ImGui::IsItemHovered();
-            g_auth.keyInput = buf;
-            if (ImGui::IsItemDeactivatedAfterEdit()) {
-                g_auth.keyInput = NormalizeKey(g_auth.keyInput);
-                if (g_auth.keyInput.size() > sizeof(buf) - 1) g_auth.keyInput.resize(sizeof(buf) - 1);
+            if (TapInRect(fieldId, ImRect(fMin, fMax))) {
+                g_auth.fieldFocused = true;
+                g_auth.wantFocusInput = true;
             }
 
-            ImGui::PopItemWidth();
-            ImGui::PopStyleVar();
-            ImGui::PopStyleColor(5);
+            {
+                float tx = fMin.x + padX * 0.55f;
+                float ty = fMin.y + (fieldH - lineH) * 0.5f;
+                float textMaxW = (fMax.x - padX * 0.55f) - tx;
+                std::string shown = g_auth.keyInput;
+                if (!shown.empty() && !g_auth.showKey) shown = std::string(shown.size(), '*');
+                if (shown.empty()) {
+                    dl->AddText(ImVec2(tx, ty), Alpha(XC_DIM, 0.85f), "Tempel key di sini");
+                } else {
+                    dl->AddText(ImVec2(tx, ty), IM_COL32(255, 242, 219, 255), FitText(shown, textMaxW).c_str());
+                }
+                // kursor berkedip saat field dipilih
+                if (g_auth.fieldFocused && fmodf(t, 1.0f) < 0.5f) {
+                    float cx = tx;
+                    if (!shown.empty()) {
+                        std::string head = FitText(shown, textMaxW);
+                        cx = tx + ImGui::CalcTextSize(head.c_str()).x + 2.0f;
+                    }
+                    dl->AddLine(ImVec2(cx, ty - 1.0f), ImVec2(cx, ty + lineH + 1.0f), Alpha(XC_GOLD, 0.9f), 1.6f);
+                }
+            }
 
-            ImU32 border = fieldActive  ? Alpha(accent, 0.95f)
-                         : fieldHovered ? Alpha(accent, 0.62f)
-                         : Alpha(XC_STROKE, 1.0f);
-            dl->AddRect(fMin, fMax, border, 10.0f * scale, 0, fieldActive ? 1.6f : 1.2f);
+            {
+                ImU32 border = fieldActive  ? Alpha(accent, 0.95f)
+                             : fieldHovered ? Alpha(accent, 0.62f)
+                             : Alpha(XC_STROKE, 1.0f);
+                dl->AddRect(fMin, fMax, border, 10.0f * scale, 0, fieldActive ? 1.6f : 1.2f);
+            }
 
             // tombol mata show/hide
             ImGui::SetCursorScreenPos(ImVec2(fMax.x + gapS, fMin.y));
@@ -678,7 +800,7 @@ inline void DrawLoginUI(ImGuiIO& io) {
                 } else {
                     g_auth.keyInput = pasted;
                     SetToast("Yang di-copy bukan key", false);
-                    g_auth.wantFocusInput = true;
+                    g_auth.fieldFocused = true;
                 }
             }
             y = fMax.y + gapS;
@@ -709,13 +831,32 @@ inline void DrawLoginUI(ImGuiIO& io) {
                 if (active) g_auth.cardAnim = 0.0f;
                 else        StartVerify(g_auth.keyInput, false);
             }
-            if (submitted && !g_auth.checking) {
-                if (active) g_auth.cardAnim = 0.0f;
-                else        StartVerify(g_auth.keyInput, false);
+            // Ketik manual (keyboard fisik / stik) tetap didukung walau field
+            // digambar manual: karakter dari ImGui input queue + backspace + enter.
+            if (g_auth.fieldFocused && !g_auth.checking) {
+                ImGuiIO& kio = ImGui::GetIO();
+                bool changed = false;
+                for (int i = 0; i < kio.InputQueueCharacters.Size; ++i) {
+                    ImWchar c = kio.InputQueueCharacters[i];
+                    if (c >= 32 && c < 127 && g_auth.keyInput.size() < 32) {
+                        g_auth.keyInput.push_back((char)c);
+                        changed = true;
+                    }
+                }
+                if (ImGui::IsKeyPressed(ImGui::GetKeyIndex(ImGuiKey_Backspace), true) && !g_auth.keyInput.empty()) {
+                    g_auth.keyInput.pop_back();
+                    changed = true;
+                }
+                if (changed) kio.InputQueueCharacters.resize(0);
+                if (ImGui::IsKeyPressed(ImGui::GetKeyIndex(ImGuiKey_Enter), false) ||
+                    ImGui::IsKeyPressed(ImGui::GetKeyIndex(ImGuiKey_KeyPadEnter), false)) {
+                    if (active) g_auth.cardAnim = 0.0f;
+                    else        StartVerify(g_auth.keyInput, false);
+                }
             }
             y = XRound(y + btnH + gB);
 
-            // ---- footer kecil: brand + bantuan ----
+            // ---- footer kecil: brand + bantuan (area tap diperbesar) ----
             {
                 const char* brand = "@FiturinEngine";
                 const char* ask   = "Butuh key? ";
@@ -724,23 +865,30 @@ inline void DrawLoginUI(ImGuiIO& io) {
                 float askW   = ImGui::CalcTextSize(ask).x;
                 float actW   = ImGui::CalcTextSize(act).x;
                 float needW  = brandW + gapM + askW + actW;
+                float footH  = lineH * 1.8f;
+                float padT   = (footH - lineH) * 0.5f;
 
                 float actX = x + innerW - actW;
                 float askX = actX - askW;
-                dl->AddText(ImVec2(askX, y), Alpha(XC_MUTED, 0.80f), ask);
-                dl->AddText(ImVec2(actX, y), Alpha(XC_GOLD, 0.95f), act);
-                if (ImGui::IsMouseHoveringRect(ImVec2(actX, y), ImVec2(actX + actW, y + lineH))) {
-                    dl->AddLine(ImVec2(actX, y + lineH + 1.0f), ImVec2(actX + actW, y + lineH + 1.0f), Alpha(XC_GOLD, 0.8f), 1.0f);
-                    if (io.MouseReleased[0]) OpenUrl("https://t.me/axell_08");
-                }
+                dl->AddText(ImVec2(askX, y + padT), Alpha(XC_MUTED, 0.80f), ask);
+                dl->AddText(ImVec2(actX, y + padT), Alpha(XC_GOLD, 0.95f), act);
+
+                ImGuiIO& fio = ImGui::GetIO();
+                ImRect actBb(ImVec2(actX, y), ImVec2(actX + actW, y + footH));
+                if (actBb.Contains(fio.MousePos))
+                    dl->AddLine(ImVec2(actX, y + footH), ImVec2(actX + actW, y + footH), Alpha(XC_GOLD, 0.8f), 1.0f);
+                if (TapInRect(ImGui::GetCurrentWindow()->GetID("##xloopChatOwner"), actBb, -1.0f))
+                    OpenUrl("https://t.me/axell_08");
+
                 if (needW <= innerW) {
-                    dl->AddText(ImVec2(x, y), Alpha(XC_GOLD, 0.85f), brand);
-                    if (ImGui::IsMouseHoveringRect(ImVec2(x, y), ImVec2(x + brandW, y + lineH))) {
-                        dl->AddLine(ImVec2(x, y + lineH + 1.0f), ImVec2(x + brandW, y + lineH + 1.0f), Alpha(XC_GOLD, 0.7f), 1.0f);
-                        if (io.MouseReleased[0]) OpenUrl("https://t.me/FiturinEngine");
-                    }
+                    dl->AddText(ImVec2(x, y + padT), Alpha(XC_GOLD, 0.85f), brand);
+                    ImRect brandBb(ImVec2(x, y), ImVec2(x + brandW, y + footH));
+                    if (brandBb.Contains(fio.MousePos))
+                        dl->AddLine(ImVec2(x, y + footH), ImVec2(x + brandW, y + footH), Alpha(XC_GOLD, 0.7f), 1.0f);
+                    if (TapInRect(ImGui::GetCurrentWindow()->GetID("##xloopBrand"), brandBb, -1.0f))
+                        OpenUrl("https://t.me/FiturinEngine");
                 } else {
-                    dl->AddText(ImVec2(x, y), Alpha(XC_GOLD, 0.85f), brand);
+                    dl->AddText(ImVec2(x, y + padT), Alpha(XC_GOLD, 0.85f), brand);
                 }
             }
 
