@@ -4455,8 +4455,18 @@ void ImGui::EndFrame()
 
     // Hide implicit/fallback "Debug" window if it hasn't been used
     g.WithinFrameScopeWithImplicitWindow = false;
-    if (g.CurrentWindow && !g.CurrentWindow->WriteAccessed)
+    if (g.CurrentWindow && g.CurrentWindow->IsFallbackWindow) {
+        // Window fallback "Debug##Default" TIDAK PERNAH boleh tergambar: kalau ada
+        // kode yang memakai GetWindowDrawList()/GetCurrentWindow() setelah End()
+        // terakhir, window ini jadi "WriteAccessed" dan muncul sebagai kotak
+        // "Debug" kosong di pojok kiri atas. Kita matikan tanpa syarat, sekaligus
+        // tetap memanggil End() agar stack window tetap seimbang.
         g.CurrentWindow->Active = false;
+        g.CurrentWindow->Hidden = true;
+        g.CurrentWindow->WriteAccessed = false;
+    } else if (g.CurrentWindow && !g.CurrentWindow->WriteAccessed) {
+        g.CurrentWindow->Active = false;
+    }
     End();
 
     // Update navigation: CTRL+Tab, wrap-around requests
@@ -4547,6 +4557,11 @@ void ImGui::Render()
     {
         ImGuiWindow* window = g.Windows[n];
         IM_MSVC_WARNING_SUPPRESS(6011); // Static Analysis false positive "warning C6011: Dereferencing NULL pointer 'window'"
+        // Jangan pernah gambar fallback window "Debug##Default". Window ini hanya
+        // jaring pengaman kalau ada widget yang dipanggil di luar Begin()/End(),
+        // dan kalau ikut tergambar dia jadi kotak "Debug" kosong di pojok kiri atas.
+        if (window->IsFallbackWindow)
+            continue;
         if (IsWindowActiveAndVisible(window) && (window->Flags & ImGuiWindowFlags_ChildWindow) == 0 && window != windows_to_render_top_most[0] && window != windows_to_render_top_most[1])
             AddRootWindowToDrawData(window);
     }
@@ -4713,9 +4728,11 @@ bool IsPointOverAnyWindow(ImVec2 point) {
         // IM_MSVC_WARNING_SUPPRESS(28182); // [Static Analyzer] Dereferencing NULL pointer.
         if (!window->Active || window->Hidden) continue;
         if (window->Flags & ImGuiWindowFlags_NoMouseInputs) continue;
-        // __android_log_print(ANDROID_LOG_INFO, "angousana", "windowName: %s", window->Name);
+        // Lewati window fallback "Debug##Default": kalau tidak, window kosong
+        // ini ikut "mengonsumsi" sentuhan sehingga tombol di dalam kartu login
+        // (mis. PASTE) tidak pernah menerima tap.
         if (window->IsFallbackWindow) continue;
-        // if (!strcmp(window->Name, "Debug##Default")) continue;
+        if (window->Name && !strcmp(window->Name, "Debug##Default")) continue;
 
         // Using the clipped AABB, a child window will typically be clipped by its parent (not always)
         ImRect bb(window->OuterRectClipped);

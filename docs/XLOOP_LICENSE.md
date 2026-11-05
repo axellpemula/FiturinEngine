@@ -125,21 +125,69 @@ Kalau user ganti device / restore APK, HWID berubah → minta admin reset slot d
 
 ## 7. Tampilan kartu key
 
-Kartu aktivasi baru mengikuti tema menu (dark glass + gold `#FFB800`, font & sudut sama):
+Kartu aktivasi mengikuti tema menu (dark glass + gold `#FFB800`):
 
-- **Panel kiri**: logo, nama produk, badge status (`LICENSE REQUIRED` / `LICENSE ACTIVE`),
-  3 baris fitur, tombol komunitas.
-- **Panel kanan**: judul + hint, field key (fokus gold, tombol mata show/hide, tombol PASTE
-  dengan validasi format), kotak status (info / spinner / sukses hijau / error merah),
-  tombol utama `ACTIVATE LICENSE` → `CONTINUE TO MENU`, baris DEVICE + masa aktif,
-  link owner dan footer.
-- Enter di keyboard = submit. Paste dari clipboard langsung dinormalisasi ke `XLVP-XXXX-XXXX`
-  (huruf besar, spasi dihapus).
-- Toast melayang untuk error/sukses, animasi fade + slide saat kartu muncul/hilang.
-- Ukuran mengikuti resolusi (`S = clamp(height/900, 0.52, 1.0)`).
+- **Header**: logo, wordmark `FITURIN ENGINE`, badge status (`LOCKED` gold / `ACTIVE` hijau),
+  garis aksen bergerak di tepi atas.
+- **Isi**: judul + hint, label `LICENSE KEY` + keterangan `Format: XLVP-XXXX-XXXX`,
+  satu baris `[field key] [ikon mata] [PASTE]`, kotak status (info / spinner + progress /
+  sukses hijau / error merah), tombol utama `ACTIVATE LICENSE` → `CONTINUE TO MENU`,
+  baris `DEVICE <hwid>` (`Expires: YYYY-MM-DD` saat aktif), footer `@FiturinEngine` +
+  `Belum punya key? Chat owner`.
+- Enter di keyboard = submit. Isi clipboard dinormalisasi dulu (`NormalizeKey`) supaya
+  key dengan spasi, newline, huruf kecil, tanpa strip, atau tercampur teks lain tetap sah.
+- Toast melayang untuk error/sukses; animasi fade + slide saat kartu muncul/hilang.
 
-Pratinjau render (headless ImGui, 1280×720) ada di `docs/preview/`:
-`login-idle.png`, `login-checking.png`, `login-error.png`, `login-banned.png`, `login-active.png`.
+### Ketahanan di resolusi device
+
+Semua ukuran (padding, gap, tinggi tombol/field, lebar kartu) diturunkan dari
+`GetTextLineHeight()`, **bukan** dari konstanta 1080p, jadi tetap rapi saat font device
+diperbesar (contoh nyata: 1565×810 dengan font ±2.4× lebih besar):
+
+- lebar kartu = `max(isi terpanjang)` di-clamp ke `96%` lebar layar;
+- kalau tinggi kartu > `94%` layar, jarak antar elemen dirapatkan otomatis
+  (font tidak diperkecil);
+- teks panjang (HWID, pesan server) dipotong dengan `...` lewat `FitText()`,
+  jadi tidak ada baris yang menabrak elemen lain;
+- `DEVICE` + `Expires` dipisah kiri/kanan dan saling memotong ruang, footer turun
+  satu baris kalau layar sempit.
+
+### Tombol PASTE
+
+Backend `imgui_impl_android` **tidak** menyediakan clipboard (`GetClipboardTextFn` tidak
+pernah diisi), jadi `ImGui::GetClipboardText()` selalu kosong. Karena itu kartu memakai
+provider sendiri:
+
+```cpp
+// main.cpp, sekali saat boot
+xloop::SetClipboardProvider([]() -> std::string {
+    JNIEnv* env = GetJNIEnv();
+    return env ? getClipboard(env) : std::string();   // ClipboardManager via JNI
+});
+```
+
+`xloop::ReadClipboard()` memakai provider itu lebih dulu, lalu fallback ke
+`ImGui::GetClipboardText()` (berguna untuk harness desktop).
+
+### Catatan window `Debug##Default`
+
+ImGui membuat fallback window `Debug##Default` di `NewFrame()` untuk mencegah crash
+kalau ada widget dipanggil di luar `Begin()/End()`. Window ini **tidak** memakai flag
+`IsFallbackWindow` di jalur hit-test + render, sehingga:
+
+1. muncul sebagai kotak "Debug" kosong di kiri atas, dan
+2. ikut mengonsumsi tap sehingga tombol di kartu (mis. PASTE) tidak menerima sentuhan.
+
+Perbaikan di `include/external/imgui/src/imgui.cpp`:
+
+- `ImGui::Render()` melewati (`continue`) semua `IsFallbackWindow`;
+- `EndFrame()` selalu menonaktifkan fallback window (`Active = false`, `Hidden = true`)
+  walau ada kode yang menyentuhnya lewat `GetWindowDrawList()` setelah `End()` terakhir;
+- `IsPointOverAnyWindow()` juga melewati fallback window.
+
+Pratinjau render (headless ImGui, 1565×810, font diperbesar 2.4×) ada di `docs/preview/`:
+`login-idle.png`, `login-pasted.png`, `login-checking.png`, `login-error.png`,
+`login-banned.png`, `login-active.png`.
 
 ---
 

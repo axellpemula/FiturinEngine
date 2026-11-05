@@ -305,6 +305,7 @@ std::string getAndroidID(JNIEnv *env = nullptr) {
 
 
 JNIEnv* GetJNIEnv() {
+    if (!VM) return nullptr;
     JNIEnv* env;
     jint getEnvResult = VM->GetEnv((void**)&env, JNI_VERSION_1_6);
     if (getEnvResult == JNI_EDETACHED) {

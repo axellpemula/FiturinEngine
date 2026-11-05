@@ -117,16 +117,73 @@ inline std::string Trim(const std::string& s) {
 }
 
 // Key panel selalu berbentuk XLVP-XXXX-XXXX (dipaksa upper-case oleh server).
+inline bool KeyShapeOk(const std::string& k);   // didefinisikan di bawah
+
+// Rapikan isi clipboard / ketikan user jadi format baku XLVP-XXXX-XXXX.
+// Toleran terhadap spasi, newline, huruf kecil, tanpa tanda hubung, atau key
+// yang ditempel bersama teks lain (mis. "key saya: xlvp-ab12-cd34").
 inline std::string NormalizeKey(const std::string& raw) {
-    std::string k = Trim(raw);
-    k.erase(std::remove_if(k.begin(), k.end(), [](unsigned char c) { return c == ' ' || c == '\t'; }), k.end());
-    k.erase(std::remove(k.begin(), k.end(), '\r'), k.end());
-    k.erase(std::remove(k.begin(), k.end(), '\n'), k.end());
-    ToUpperInPlace(k);
-    return k;
+    static const char* kPrefix = "XLVP";
+    std::string k;
+    k.reserve(raw.size());
+
+    std::string up = raw;
+    ToUpperInPlace(up);
+
+    // 1) kalau ada prefix, ambil mulai dari kemunculan pertama prefix
+    size_t pos = up.find(kPrefix);
+    if (pos != std::string::npos) up = up.substr(pos);
+    else                          k = std::string(kPrefix);
+
+    // 2) kumpulkan karakter alfanumerik valid (maks 8 setelah prefix)
+    int taken = 0;
+    for (char c : up) {
+        bool alnum = (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9');
+        if (!alnum) continue;
+        if (taken >= 8) break;
+        if (k.size() < 4) {                 // masih di prefix
+            if (c != kPrefix[k.size()]) {   // bukan prefix? mulai hitung ulang
+                k.clear();
+                break;
+            }
+            k.push_back(c);
+            continue;
+        }
+        k.push_back(c);
+        ++taken;
+    }
+
+    if (k.size() < 4) {
+        // tidak ada prefix sama sekali: pakai 8 karakter alfanumerik pertama
+        k = std::string(kPrefix);
+        int n = 0;
+        for (char c : up) {
+            bool alnum = (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9');
+            if (!alnum) continue;
+            if (n >= 8) break;
+            k.push_back(c);
+            ++n;
+        }
+    }
+
+    // 3) beri tanda hubung: XLVP-XXXX-XXXX
+    std::string out = k.substr(0, k.size() < 4 ? k.size() : 4);
+    if (k.size() > 4) out += std::string("-") + k.substr(4, 4);
+    if (k.size() > 8) out += std::string("-") + k.substr(8, 4);
+
+    // Kalau hasilnya belum berbentuk key yang sah, jangan dipaksa berubah:
+    // kembalikan apa yang diketik user (uppercase, tanpa spasi pinggir) supaya
+    // field input tidak "aneh" saat user masih mengetik.
+    if (!KeyShapeOk(out)) {
+        std::string keep = Trim(raw);
+        if (keep.empty()) return std::string();
+        ToUpperInPlace(keep);
+        return keep;
+    }
+    return out;
 }
 
-inline bool MatchesKeyRegex(const std::string& k) {
+inline bool KeyShapeOk(const std::string& k) {
     static const char* prefix = "XLVP-";
     if (k.size() != 14) return false;
     if (k.compare(0, 5, prefix) != 0) return false;
@@ -139,6 +196,8 @@ inline bool MatchesKeyRegex(const std::string& k) {
     }
     return true;
 }
+
+inline bool MatchesKeyRegex(const std::string& k) { return KeyShapeOk(k); }
 
 // ---------------------------- base64 ----------------------------
 inline std::string Base64Encode(const unsigned char* data, size_t len) {
