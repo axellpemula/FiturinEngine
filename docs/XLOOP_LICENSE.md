@@ -111,6 +111,56 @@ UI juga dikunci: selama `IsLoggedIn() == false`, floating button + menu tidak di
 
 ---
 
+## 5b. Jaringan (kalau muncul "Server belum bisa dihubungi")
+
+Kartu hanya menampilkan pesan ramah. Penyebab sebenarnya ada di log:
+
+```bash
+adb logcat -s XLOOP
+```
+
+Baris yang dikeluarkan saat validasi:
+
+```
+validate -> https://xlooppanelid.vercel.app/api/validate (tool=fiturin8bp v=1.0.0)
+http transport gagal: url=... curl=7(7) Couldn't connect to server      <- tidak sampai server
+diag hasil: stage=connect|tls|http curl=<n> <pesan>
+license failed: ... (http=200 body={"error":"invalid_key"})              <- server menjawab, key salah
+```
+
+Arti `curl` yang paling sering:
+
+| curl | Arti | Tindakan |
+|---|---|---|
+| 6 | DNS gagal (tidak ada internet / DNS diblokir) | cek koneksi device |
+| 7 / 28 | tidak bisa connect / timeout | coba jaringan lain (ISP/DNS bisa memblokir) |
+| 60 / 77 / 83 | TLS: sertifikat/CA tidak bisa diverifikasi | lihat catatan CA di bawah |
+| 0 | request tidak pernah jalan (`curl_easy_init` gagal) | `libcurl.a` tidak ter-load |
+
+Fitur diagnosa `RunDiagnostics()` mengirim satu POST kosong ke endpoint yang sama supaya
+`stage` jelas: `connect` (belum sampai server), `tls` (sertifikat), atau `http` (server
+menjawab, berarti masalahnya bukan jaringan).
+
+**Catatan CA (penting).** Build ini memakai `libcurl 7.51.0` + `OpenSSL 1.1.0c` statis yang
+tidak membawa CA bundle. Pada Android modern (7+) `/etc/ssl/certs` tidak lengkap, sehingga
+verifikasi TLS bisa gagal (`curl 60`) walau URL benar dan device online. `PostJson()`
+sekarang memakai urutan: `CURL_CA_BUNDLE` / `SSL_CERT_FILE` (env) →
+`/system/etc/security/cacerts` (direktori CA sistem Android) → default libcurl.
+
+Kalau di device tertentu tetap `curl 60`, cara paling aman: taruh `cacert.pem` (bundle
+Mozilla) di assets, salin ke `SessionDir()/cacert.pem` saat boot, lalu set
+`CURL_CA_BUNDLE` ke path itu.
+
+**Nonce.** Nonce dibuat dari `/dev/urandom` → base64url. Supaya hasil acak tidak pernah
+kebetulan menyerupai hostname (mis. mengandung titik seperti `172-xxx`), nonce yang
+"kotor" otomatis diganti bentuk hex 48 karakter (tetap lolos `^[A-Za-z0-9_-]{16,64}$`).
+
+**Session.** `StorageDir()` sekarang memotong NUL pada `/proc/self/cmdline`. Sebelumnya
+nama paket terbawa byte NUL sehingga direktori session tidak valid dan key harus ditempel
+ulang setiap kali game dibuka.
+
+---
+
 ## 6. HWID
 
 `android:<sha512 hex 64 char>` dari gabungan:

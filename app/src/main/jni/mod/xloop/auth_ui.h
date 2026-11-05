@@ -48,6 +48,8 @@ struct AuthState {
     std::string toast;
     std::string message;                   // pesan status di kartu
     std::string reseller;
+    std::string netHint;                   // detail singkat saat koneksi gagal
+    bool        diagRunning = false;
     std::string expiredText;
     int64_t     expiredEpoch    = 0;
     int         maxDevice       = 0;
@@ -97,7 +99,7 @@ inline std::string FriendlyMessage(Reason r) {
     switch (r) {
         case Reason::EmptyKey:      return "Key kamu masih kosong";
         case Reason::BadKeyFormat:  return "Format key-nya belum pas";
-        case Reason::Network:       return "Koneksi bermasalah, coba lagi ya";
+        case Reason::Network:       return "Server belum bisa dihubungi, coba lagi";
         case Reason::RateLimited:   return "Terlalu banyak percobaan, tunggu sebentar";
         case Reason::InvalidKey:    return "Key-nya nggak dikenali";
         case Reason::KeyExpired:    return "Key kamu sudah habis";
@@ -141,6 +143,13 @@ inline void ApplyResult(const Result& r, bool silent) {
         // Pesan server sengaja tidak dipakai mentah-mentah: bahasanya teknis
         // (signature, payload, HWID, tool) dan bikin user bingung.
         g_auth.message = FriendlyMessage(r.reason);
+        if (r.reason == Reason::Network) {
+            // Simpan detail teknis di state (bukan di layar) + log sekali.
+            g_auth.netHint = r.httpError.empty()
+                           ? ("http=" + std::to_string(r.httpCode))
+                           : r.httpError;
+            Log("network gagal: %s", g_auth.netHint.c_str());
+        }
         FillCache(false, 0, 0, "");
         if (!silent) {
             g_auth.toast = g_auth.message;
