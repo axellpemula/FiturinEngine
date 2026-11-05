@@ -159,6 +159,32 @@ diperbesar (contoh nyata: 1565×810 dengan font ±2.4× lebih besar):
   menabrak elemen lain;
 - footer (brand + tombol bantuan) turun satu baris kalau layar sempit.
 
+### Kenapa tombol dulu tidak bisa ditekan (dan perbaikannya)
+
+Versi sebelumnya memakai pola khas desktop: `hovered && io.MouseReleased[0]` di atas
+`ButtonBehavior()`. Di layar sentuh pola ini rapuh:
+
+1. kalau jari bergeser sedikit sebelum diangkat, item tidak lagi `hovered` saat UP →
+   tombol tidak pernah terpicu;
+2. ImGui juga membatalkan klik bila pointer bergerak melewati batas drag, sehingga
+   semua tombol di kartu terasa "mati" (PASTE, tombol mata, bahkan `Masuk`);
+3. field key memakai `InputText`, yang butuh keyboard virtual — tidak pernah muncul di
+   overlay game, jadi field-nya juga tidak bisa dipakai.
+
+Perbaikan (semuanya di `auth_ui.h`, tanpa mengubah `menu.h`):
+
+- **Jalur tap sendiri**: hook sentuhan engine (`include/input.h`) memanggil
+  `xloop::OnRawTouch(down, x, y)` langsung dari `nativeTouchesBegin/End`, lalu
+  `TapInRect()` memutuskan tombol mana yang kena. Tidak bergantung pada state
+  mouse/klik/fokus ImGui sama sekali.
+- **Toleransi tap**: DOWN harus mendarat di tombol, UP boleh meleset sampai ±0.85 baris
+  teks — jadi tap tetap terasa responsif di HP. Satu tap hanya memicu satu tombol.
+- **Field key digambar manual** (bukan `InputText`): tap untuk memilih field, teks dari
+  clipboard langsung tampil; keyboard fisik tetap didukung lewat input queue ImGui.
+  Tidak ada lagi ketergantungan pada keyboard virtual.
+- `Masuk` selalu bisa ditekan: kalau key masih kosong hasilnya pesan
+  `Key kamu masih kosong` (bukan tombol mati).
+
 ### Tombol PASTE
 
 Backend `imgui_impl_android` **tidak** menyediakan clipboard (`GetClipboardTextFn` tidak
