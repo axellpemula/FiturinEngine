@@ -125,18 +125,26 @@ Kalau user ganti device / restore APK, HWID berubah → minta admin reset slot d
 
 ## 7. Tampilan kartu key
 
-Kartu aktivasi mengikuti tema menu (dark glass + gold `#FFB800`):
+Kartu aktivasi sengaja dibuat **sesimpel mungkin** (tema dark glass + gold `#FFB800`):
 
-- **Header**: logo, wordmark `FITURIN ENGINE`, badge status (`LOCKED` gold / `ACTIVE` hijau),
-  garis aksen bergerak di tepi atas.
-- **Isi**: judul + hint, label `LICENSE KEY` + keterangan `Format: XLVP-XXXX-XXXX`,
-  satu baris `[field key] [ikon mata] [PASTE]`, kotak status (info / spinner + progress /
-  sukses hijau / error merah), tombol utama `ACTIVATE LICENSE` → `CONTINUE TO MENU`,
-  baris `DEVICE <hwid>` (`Expires: YYYY-MM-DD` saat aktif), footer `@FiturinEngine` +
-  `Belum punya key? Chat owner`.
-- Enter di keyboard = submit. Isi clipboard dinormalisasi dulu (`NormalizeKey`) supaya
-  key dengan spasi, newline, huruf kecil, tanpa strip, atau tercampur teks lain tetap sah.
-- Toast melayang untuk error/sukses; animasi fade + slide saat kartu muncul/hilang.
+```
+Masuk dulu yuk                    <- judul
+Tempel key kamu di bawah ini      <- satu kalimat bantuan
+[ Tempel key di sini ] [mata] [PASTE]
+(status singkat, hanya kalau ada: "Mengecek key...", "Key ini sudah diblokir", ...)
+[            Masuk              ]
+@FiturinEngine        Butuh key? Chat owner
+```
+
+- **Tidak ada istilah teknis di layar**: tanpa `XLOOP PANEL`, `Ed25519`, `HWID`,
+  `format XLVP-XXXX-XXXX`, nama server, atau kode error mentah.
+- Pesan server dipetakan ke bahasa biasa lewat `FriendlyMessage()` di `auth_ui.h`
+  (`license_core.h` tetap menyimpan pesan teknis untuk log/`adb logcat`).
+- Baris status hanya muncul kalau memang ada sesuatu (sedang mengecek / gagal / masa aktif).
+  Saat aktif isinya `Aktif sampai 31-12-2026` (tanpa jam/WM).
+- Enter di keyboard = submit. Isi clipboard dinormalisasi dulu (`NormalizeKey`) supaya key
+  dengan spasi, newline, huruf kecil, tanpa strip, atau tercampur teks lain tetap sah.
+- Tombol `Masuk` berubah jadi `Lanjut` saat key sudah aktif; toast melayang untuk error/sukses.
 
 ### Ketahanan di resolusi device
 
@@ -147,10 +155,9 @@ diperbesar (contoh nyata: 1565×810 dengan font ±2.4× lebih besar):
 - lebar kartu = `max(isi terpanjang)` di-clamp ke `96%` lebar layar;
 - kalau tinggi kartu > `94%` layar, jarak antar elemen dirapatkan otomatis
   (font tidak diperkecil);
-- teks panjang (HWID, pesan server) dipotong dengan `...` lewat `FitText()`,
-  jadi tidak ada baris yang menabrak elemen lain;
-- `DEVICE` + `Expires` dipisah kiri/kanan dan saling memotong ruang, footer turun
-  satu baris kalau layar sempit.
+- teks panjang dipotong dengan `...` lewat `FitText()`, jadi tidak ada baris yang
+  menabrak elemen lain;
+- footer (brand + tombol bantuan) turun satu baris kalau layar sempit.
 
 ### Tombol PASTE
 
@@ -223,18 +230,21 @@ key expired, key banned, public key kosong/rusak, public key format PEM/hex.
 
 | Pesan di kartu | Arti | Tindakan |
 |---|---|---|
-| `Key format must be XLVP-XXXX-XXXX` | format key salah | cek key dari reseller |
-| `Invalid key` | key tidak ada di panel | cek ejaan / key salah tool |
-| `This key has expired` | `expired_at` lewat | generate key baru |
-| `This key has been banned` | di-ban admin / auto-ban device | hubungi owner |
-| `Key is not for this tool` | `tool_slug` build ≠ panel | samakan `XLOOP_TOOL_SLUG` |
-| `Key does not match this tool version` | `tool_version` beda | samakan `XLOOP_TOOL_VERSION` |
-| `Device limit reached…` | slot HWID penuh | reset di HWID Manager |
-| `Too many attempts…` | kena rate limit panel | tunggu 1 menit |
-| `Cannot reach license server` | jaringan / URL salah | cek `XLOOP_PANEL_URL` |
-| `License signature is invalid` | public key build ≠ keypair panel | salin ulang public key |
-| `Ed25519 public key is not configured` | `XLOOP_PUBLIC_KEY_B64` kosong | isi dulu |
-| `Request rejected by server (…invalid_request)` | body ditolak panel (mis. slug/version kosong) | cek `tool_slug`/`tool_version` |
+| `Key kamu masih kosong` | field belum diisi | tempel/ketik key |
+| `Format key-nya belum pas` | format key salah | cek key dari reseller |
+| `Key-nya nggak dikenali` | key tidak ada di panel | cek ejaan / key salah tool |
+| `Key kamu sudah habis` | `expired_at` lewat | generate key baru |
+| `Key ini sudah diblokir` | di-ban admin / auto-ban device | hubungi owner |
+| `Key ini bukan untuk versi ini` | `tool_slug`/`tool_version` build ≠ panel | samakan di `license_core.h` |
+| `Key sudah dipakai di device lain` | slot HWID penuh | reset di HWID Manager |
+| `Key ini terikat di device lain` | payload `hardware_id` ≠ device ini | reset slot / pakai device asal |
+| `Terlalu banyak percobaan, tunggu sebentar` | kena rate limit panel | tunggu 1 menit |
+| `Koneksi bermasalah, coba lagi ya` | jaringan / URL salah | cek `XLOOP_PANEL_URL` + koneksi |
+| `Belum berhasil, coba lagi ya` | signature/payload ditolak (public key build ≠ keypair panel) | salin ulang public key |
+| `Fitur belum siap, hubungi admin` | `XLOOP_PUBLIC_KEY_B64` kosong/rusak | isi dulu |
+
+> Pesan teknis detail (mis. `signature invalid`, `replay detected`, `invalid_request`) tetap
+> ditulis ke log `XLOOP` (`adb logcat -s XLOOP`) untuk diagnosis, tapi **tidak** muncul di kartu.
 
 ---
 
