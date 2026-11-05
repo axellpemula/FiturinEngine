@@ -10,6 +10,12 @@
 //   - Login : tombol ACTIVATE -> thread -> xloop::VerifyKey() -> session disimpan.
 //   - Gate  : RequireLicense() dipanggil tersebar (sebelum ESP, sebelum
 //             Auto Play, sebelum toggle fitur) sesuai anjuran panel.
+//
+// Catatan UI: ukuran font di device bisa jauh lebih besar dari asumsi
+// (font di-push dengan skala Arial Black), jadi semua posisi & lebar dihitung
+// dari hasil CalcTextSize(), bukan konstanta mati. Isi kartu juga memakai
+// BeginChild supaya kalau layarnya pendek / teks kebesaran, isinya bisa
+// di-scroll, tidak saling tumpang-tindih.
 
 #include <string>
 #include <thread>
@@ -83,6 +89,37 @@ inline void FillCache(bool valid, int64_t expiredEpoch, int64_t verifiedAt, cons
     c.secret = secret;      // hanya di memori, tidak pernah ditulis ke disk
 }
 
+// ======================= teks ramah untuk user =======================
+// Pesan teknis dari license_core (Ed25519, payload, HWID, tool, server, dsb)
+// sengaja TIDAK ditampilkan ke user. Kartu login cuma butuh kalimat singkat.
+inline std::string FriendlyMessage(Reason r) {
+    switch (r) {
+        case Reason::EmptyKey:      return "Key kamu masih kosong";
+        case Reason::BadKeyFormat:  return "Format key-nya belum pas";
+        case Reason::Network:       return "Koneksi bermasalah, coba lagi ya";
+        case Reason::RateLimited:   return "Terlalu banyak percobaan, tunggu sebentar";
+        case Reason::InvalidKey:    return "Key-nya nggak dikenali";
+        case Reason::KeyExpired:    return "Key kamu sudah habis";
+        case Reason::KeyBanned:     return "Key ini sudah diblokir";
+        case Reason::DeviceLimit:   return "Key sudah dipakai di device lain";
+        case Reason::WrongTool:
+        case Reason::WrongVersion:
+        case Reason::ToolMismatch:  return "Key ini bukan untuk versi ini";
+        case Reason::HwidMismatch:  return "Key ini terikat di device lain";
+        default:                    return "Belum berhasil, coba lagi ya";
+    }
+}
+
+// Label kecil di bawah field: cuma angka sisa hari, tanpa istilah teknis.
+inline std::string ShortExpiry(const std::string& expiryText) {
+    if (expiryText.empty() || expiryText == "N/A" || expiryText == "Lifetime") return std::string();
+    // "2026-12-31 00:00 UTC" -> "31-12-2026"
+    if (expiryText.size() >= 10 && expiryText[4] == '-' && expiryText[7] == '-') {
+        return expiryText.substr(8, 2) + "-" + expiryText.substr(5, 2) + "-" + expiryText.substr(0, 4);
+    }
+    return expiryText;
+}
+
 inline void ApplyResult(const Result& r, bool silent) {
     g_auth.hasResult = true;
     g_auth.lastReason = r.reason;
@@ -90,7 +127,7 @@ inline void ApplyResult(const Result& r, bool silent) {
     g_auth.checking = false;
 
     if (r.ok) {
-        g_auth.message = "License activated. Welcome back!";
+        g_auth.message = "Masa aktif kamu masih jalan";
         g_auth.expiredEpoch = r.expiredEpoch;
         g_auth.expiredText = r.expiredEpoch > 0 ? FormatEpoch(r.expiredEpoch) : std::string("Lifetime");
         g_auth.maxDevice = r.maxDevice;
@@ -100,10 +137,12 @@ inline void ApplyResult(const Result& r, bool silent) {
         g_auth.toastTimer = 0.0f;                 // kartu menutup sendiri, tak perlu toast
         FillCache(true, r.expiredEpoch, (int64_t)time(nullptr), r.key, r.secret);
     } else {
-        g_auth.message = r.message;
+        // Pesan server sengaja tidak dipakai mentah-mentah: bahasanya teknis
+        // (signature, payload, HWID, tool) dan bikin user bingung.
+        g_auth.message = FriendlyMessage(r.reason);
         FillCache(false, 0, 0, "");
         if (!silent) {
-            g_auth.toast = r.message;
+            g_auth.toast = g_auth.message;
             g_auth.toastTimer = 4.0f;
             g_auth.toastColor[0] = 1.00f; g_auth.toastColor[1] = 0.48f; g_auth.toastColor[2] = 0.46f; g_auth.toastColor[3] = 1.0f;
         }
@@ -135,7 +174,7 @@ inline void RestoreFromSession(const json& s) {
     g_auth.keyInput = UnprotectKey(JsonStr(s, "key_protected"));
     g_auth.hasResult = true;
     g_auth.lastReason = Reason::Ok;
-    g_auth.message = "Session restored";
+    g_auth.message = "Selamat datang kembali";
     g_auth.checking = false;
     FillCache(true, g_auth.expiredEpoch, JsonInt(s, "verified_at"), g_auth.keyInput);
 }
@@ -153,7 +192,7 @@ inline void StartVerify(const std::string& rawKey, bool silent) {
         g_auth.hasResult = true;
         g_auth.checking = false;
         g_auth.lastReason = reason;
-        g_auth.message = ReasonMessage(reason);
+        g_auth.message = FriendlyMessage(reason);
         SetToast(g_auth.message, false);
         g_auth.wantFocusInput = true;
     };
@@ -165,7 +204,7 @@ inline void StartVerify(const std::string& rawKey, bool silent) {
         g_auth.hasResult = true;
         g_auth.checking = false;
         g_auth.lastReason = Reason::PublicKeyMissing;
-        g_auth.message = ReasonMessage(Reason::PublicKeyMissing);
+        g_auth.message = "Fitur belum siap, hubungi admin";
         SetToast(g_auth.message, false);
         return;
     }
@@ -173,7 +212,7 @@ inline void StartVerify(const std::string& rawKey, bool silent) {
     g_auth.checking = true;
     g_auth.progress = 0.0f;
     g_lastRefreshAttempt = (int64_t)time(nullptr);
-    if (!silent) g_auth.message = "Contacting license server...";
+    if (!silent) g_auth.message = "Mengecek key...";
 
     std::thread([key, silent]() {
         Result r = VerifyKey(key);
@@ -186,7 +225,7 @@ inline void StartVerify(const std::string& rawKey, bool silent) {
                 ClearSession();
                 Result denied;
                 denied.reason = Reason::HwidMismatch;
-                denied.message = "This license is already activated on another device";
+                denied.message = FriendlyMessage(Reason::HwidMismatch);
                 ApplyResult(denied, silent);
                 return;
             }
@@ -202,7 +241,7 @@ inline void StartVerify(const std::string& rawKey, bool silent) {
                 int64_t age = (int64_t)time(nullptr) - JsonInt(s, "verified_at");
                 if (age < (int64_t)OFFLINE_GRACE_MINUTES * 60) {
                     RestoreFromSession(s);
-                    g_auth.message = "Offline mode: last verified " + FormatEpoch(JsonInt(s, "verified_at"));
+                    g_auth.message = "Mode offline, key kamu masih aktif";
                     return;
                 }
             }
@@ -233,7 +272,7 @@ inline void BootAuth() {
         ClearSession();
         FillCache(false, 0, 0, "");
         g_auth.keyInput = key;
-        g_auth.message = "Session expired. Please activate again";
+        g_auth.message = "Sesi habis, masukkan key lagi";
         g_auth.hasResult = !key.empty();
     }
 }
@@ -257,7 +296,7 @@ inline bool RequireLicense(const char* where = "") {
         g_auth.loggedIn = false;
         g_auth.hasResult = true;
         g_auth.lastReason = Reason::KeyExpired;
-        g_auth.message = ReasonMessage(Reason::KeyExpired);
+        g_auth.message = FriendlyMessage(Reason::KeyExpired);
         FillCache(false, 0, 0, "");
         ClearSession();
         Log("license expired at runtime");
@@ -285,7 +324,7 @@ inline std::string ExpiryText() { return g_auth.expiredText.empty() ? "N/A" : g_
 inline std::string ResellerText() { return g_auth.reseller; }
 inline int64_t ExpiryEpoch() { return g_auth.expiredEpoch; }
 
-// ======================= UI primitives =======================
+// ======================= UI constants =======================
 static const ImU32 XC_GOLD      = IM_COL32(255, 184, 0, 255);
 static const ImU32 XC_GOLD_SOFT = IM_COL32(255, 213, 79, 255);
 static const ImU32 XC_TEXT      = IM_COL32(240, 236, 250, 255);
@@ -321,6 +360,24 @@ inline float& AnimSlot(ImGuiID id) {
 inline void LerpAnim(ImGuiID id, float target, float speed = 12.0f) {
     float& v = AnimSlot(id);
     v = ImLerp(v, target, ImClamp(ImGui::GetIO().DeltaTime * speed, 0.0f, 1.0f));
+}
+
+// Teks yang otomatis dipotong dengan "..." supaya tidak menabrak elemen lain.
+// Dipakai di baris yang lebarnya terbatas (device id, pesan status, dsb).
+inline std::string FitText(const std::string& text, float maxWidth) {
+    if (text.empty() || maxWidth <= 0.0f) return text;
+    if (ImGui::CalcTextSize(text.c_str()).x <= maxWidth) return text;
+    const char* ell = "...";
+    float ellW = ImGui::CalcTextSize(ell).x;
+    std::string cut = text;
+    while (!cut.empty() && ImGui::CalcTextSize(cut.c_str()).x + ellW > maxWidth)
+        cut.pop_back();
+    return cut + ell;
+}
+
+inline void CenterText(ImDrawList* dl, ImVec2 centerX, const char* text, ImU32 col) {
+    ImVec2 ts = ImGui::CalcTextSize(text);
+    dl->AddText(ImVec2(centerX.x - ts.x * 0.5f, centerX.y), col, text);
 }
 
 // Tombol custom bertema: accent = gold penuh, non-accent = glass gelap.
@@ -368,18 +425,19 @@ inline bool ThemeButton(const char* id, const char* label, ImVec2 size, bool acc
 
     ImU32 textCol = accent ? IM_COL32(30, 19, 0, 255) : Alpha(XC_TEXT, disabled ? 0.45f : 1.0f);
     ImVec2 ts = ImGui::CalcTextSize(label);
-    dl->AddText(ImVec2(bb.Min.x + (size.x - ts.x) * 0.5f, bb.Min.y + (size.y - ts.y) * 0.5f), textCol, label);
+    dl->AddText(ImVec2(XRound(bb.Min.x + (size.x - ts.x) * 0.5f), XRound(bb.Min.y + (size.y - ts.y) * 0.5f)),
+                textCol, label);
 
     return hovered && !disabled && g.IO.MouseReleased[0];
 }
 
 // icon: 0 = mata, 1 = paste
-inline bool CircleIconButton(const char* id, ImVec2 center, float radius, int icon, bool accent, bool disabled = false) {
+inline bool CircleIconButton(const char* id, ImVec2 topLeft, float size, int icon, bool accent, bool disabled = false) {
     ImGuiWindow* window = ImGui::GetCurrentWindow();
     if (window->SkipItems) return false;
     ImGuiContext& g = *GImGui;
     ImGuiID wid = window->GetID(id);
-    ImRect bb(center - ImVec2(radius, radius), center + ImVec2(radius, radius));
+    ImRect bb(topLeft, topLeft + ImVec2(size, size));
     ImGui::ItemSize(bb.GetSize(), 0.0f);
     if (!ImGui::ItemAdd(bb, wid)) return false;
 
@@ -389,30 +447,34 @@ inline bool CircleIconButton(const char* id, ImVec2 center, float radius, int ic
     float anim = AnimSlot(wid);
 
     ImDrawList* dl = window->DrawList;
+    float radius = size * 0.5f;
+    ImVec2 center = bb.Min + ImVec2(radius, radius);
+    float rounding = size * 0.30f;
+
     if (accent) {
         for (int i = 6; i >= 1; --i) {
             int a = (int)(18 * (1.0f - (float)i / 6.0f) * (0.6f + 0.4f * anim));
-            if (a > 0) dl->AddCircleFilled(center, radius + i, IM_COL32(255, 184, 0, a), 48);
+            if (a > 0) dl->AddRectFilled(ImVec2(bb.Min.x - i, bb.Min.y - i), ImVec2(bb.Max.x + i, bb.Max.y + i),
+                                         IM_COL32(255, 184, 0, a), rounding + i);
         }
-        dl->AddCircleFilled(center, radius, held ? IM_COL32(198, 139, 0, 255) : IM_COL32(255, 184, 0, 255), 48);
-        dl->AddCircle(center, radius, IM_COL32(255, 245, 200, 200), 48, 1.2f);
+        dl->AddRectFilled(bb.Min, bb.Max, held ? IM_COL32(198, 139, 0, 255) : IM_COL32(255, 184, 0, 255), rounding);
+        dl->AddRect(bb.Min, bb.Max, IM_COL32(255, 245, 200, 200), rounding, 0, 1.2f);
     } else {
-        dl->AddCircleFilled(center, radius, IM_COL32(26, 24, 36, 255), 48);
-        dl->AddCircle(center, radius, Alpha(XC_STROKE, 1.0f + anim), 48, 1.2f);
+        dl->AddRectFilled(bb.Min, bb.Max, IM_COL32(26, 24, 36, 255), rounding);
+        dl->AddRect(bb.Min, bb.Max, Alpha(XC_STROKE, 1.0f + anim), rounding, 0, 1.2f);
     }
 
     ImU32 col = accent ? IM_COL32(30, 19, 0, 255) : Alpha(XC_TEXT, disabled ? 0.4f : 0.80f + 0.20f * anim);
-    float r = radius * 0.50f;
+    float r = radius * 0.44f;
     if (icon == 0) {
-        // mata (dengan garis coret kalau key sedang tersembunyi)
         dl->PathArcTo(center + ImVec2(0, r * 0.40f), r * 1.05f, IM_PI * 1.12f, IM_PI * 1.88f, 24);
         dl->PathStroke(col, 0, 1.6f);
         dl->PathArcTo(center - ImVec2(0, r * 0.40f), r * 1.05f, IM_PI * 0.12f, IM_PI * 0.88f, 24);
         dl->PathStroke(col, 0, 1.6f);
         dl->AddCircleFilled(center, r * 0.32f, col, 20);
     } else {
-        dl->AddRect(ImVec2(center.x - r * 0.68f, center.y - r * 0.68f), ImVec2(center.x + r * 0.40f, center.y + r * 0.72f), col, 3.0f, 0, 1.6f);
-        dl->AddRect(ImVec2(center.x - r * 0.34f, center.y - r * 0.92f), ImVec2(center.x + r * 0.78f, center.y + r * 0.48f), col, 3.0f, 0, 1.6f);
+        dl->AddRect(ImVec2(center.x - r * 0.68f, center.y - r * 0.68f), ImVec2(center.x + r * 0.40f, center.y + r * 0.72f), col, 2.0f, 0, 1.5f);
+        dl->AddRect(ImVec2(center.x - r * 0.34f, center.y - r * 0.92f), ImVec2(center.x + r * 0.78f, center.y + r * 0.48f), col, 2.0f, 0, 1.5f);
     }
 
     return hovered && !disabled && g.IO.MouseReleased[0];
@@ -423,198 +485,168 @@ inline void OpenUrl(const char* url) {
     system(cmd.c_str());
 }
 
-// Baris fitur di panel kiri (bullet gold + teks).
-inline void DrawFeatureRow(ImDrawList* dl, ImVec2 at, float s, const char* text) {
-    float r = 3.2f * s;
-    ImVec2 c(at.x + r + 1.0f, at.y + ImGui::GetTextLineHeight() * 0.5f + 1.0f);
-    dl->AddCircleFilled(c, r * 1.9f, IM_COL32(255, 184, 0, 34), 16);
-    dl->AddCircleFilled(c, r, IM_COL32(255, 184, 0, 220), 16);
-    dl->AddText(ImVec2(at.x + 18.0f * s, at.y), XC_MUTED, text);
+// Baca clipboard Android lewat helper JNI milik engine (java.h).
+// Backend ImGui Android tidak menyediakan clipboard, jadi io.GetClipboardText()
+// selalu kosong -> tombol PASTE tidak akan pernah bekerja tanpanya.
+typedef std::string (*ClipboardProvider)();
+inline ClipboardProvider& ClipboardHook() {
+    static ClipboardProvider fn = nullptr;
+    return fn;
+}
+inline void SetClipboardProvider(ClipboardProvider fn) { ClipboardHook() = fn; }
+
+inline std::string ReadClipboard() {
+    if (ClipboardHook()) {
+        std::string s = ClipboardHook()();
+        if (!s.empty()) return s;
+    }
+    const char* imguiClip = ImGui::GetClipboardText();   // fallback (desktop/harness)
+    return imguiClip ? std::string(imguiClip) : std::string();
 }
 
 // ======================= kartu login =======================
+// Sengaja dibuat sesederhana mungkin: judul, satu field key, satu tombol.
+// Tidak ada istilah teknis (HWID, server, signature, format key) di layar.
+
 inline void DrawLoginUI(ImGuiIO& io) {
     float dt = io.DeltaTime;
     if (!g_auth.sessionLoaded) BootAuth();
     if (g_auth.toastTimer > 0.0f) g_auth.toastTimer -= dt;
 
-    if (g_auth.loggedIn) g_auth.cardAnim = ImMax(0.0f, g_auth.cardAnim - dt * 5.0f);
-    else                g_auth.cardAnim = ImMin(1.0f, g_auth.cardAnim + dt * 5.0f);
+    const bool active = g_auth.loggedIn;
+    if (active) g_auth.cardAnim = ImMax(0.0f, g_auth.cardAnim - dt * 5.0f);
+    else        g_auth.cardAnim = ImMin(1.0f, g_auth.cardAnim + dt * 5.0f);
 
     if (g_auth.checking) g_auth.progress = ImMin(1.0f, g_auth.progress + dt * 0.5f);
 
-    // Ukuran mengikuti layar: game jalan di landscape, kartu dibuat dua kolom.
-    const float S = ImClamp(io.DisplaySize.y / 900.0f, 0.52f, 1.0f);
-    const float cardW = XRound(ImMin(880.0f * S, io.DisplaySize.x * 0.86f));
-    const float cardH = XRound(ImMin(432.0f * S, io.DisplaySize.y * 0.88f));
-    const float leftW = XRound(cardW * 0.36f);
-    const float padY  = XRound(34.0f * S);
-    const float padX  = XRound(34.0f * S);
     const float alpha = g_auth.cardAnim;
+    const float scale = ImClamp(io.DisplaySize.y / 900.0f, 0.55f, 1.0f);
 
     if (alpha > 0.01f) {
-        float anim = EaseOutCubic(g_auth.cardAnim);
-        float slide = (1.0f - anim) * 22.0f * S;
+        const float lineH  = ImGui::GetTextLineHeight();
+        const float padX   = XRound(lineH * 0.85f);
+        const float padY   = XRound(lineH * 0.70f);
+        const float gapS   = XRound(lineH * 0.30f);
+        const float gapM   = XRound(lineH * 0.60f);
+        float btnH   = XRound(lineH * 1.85f);
+        float fieldH = XRound(lineH * 1.90f);
 
-        ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f + slide), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+        const ImU32 accent = active ? XC_GREEN : XC_GOLD;
+
+        const char* title   = active ? "Key kamu aktif" : "Masuk dulu yuk";
+        const char* subtitle = active ? "Selamat bermain!" : "Tempel key kamu di bawah ini";
+        const char* primary = g_auth.checking ? "Sebentar ya..." : (active ? "Lanjut" : "Masuk");
+
+        // ---- lebar kartu: cukup untuk baris terpanjang, tidak melebihi layar ----
+        float wTitle = ImGui::CalcTextSize(title).x;
+        float wSub   = ImGui::CalcTextSize(subtitle).x;
+        float wPaste = ImGui::CalcTextSize("PASTE").x + padX * 1.3f;
+        float wPrim  = ImGui::CalcTextSize(primary).x + padX * 2.0f;
+        float wField = ImGui::CalcTextSize("XLVP-XXXX-XXXX").x * 1.45f + fieldH + wPaste + gapS * 2.0f;
+        float wFoot  = ImGui::CalcTextSize("@FiturinEngine").x + gapM + ImGui::CalcTextSize("Belum punya key? Chat owner").x;
+
+        float minCardW = ImMax(ImMax(wTitle, wSub), ImMax(wPrim, wFoot)) + padX * 2.0f;
+        minCardW = ImMax(minCardW, wField + padX * 2.0f);
+        const float maxW = ImMax(280.0f, io.DisplaySize.x * 0.94f);
+        const float cardW = XRound(ImClamp(minCardW, 330.0f, maxW));
+        const float innerW = cardW - padX * 2.0f;
+
+        // ---- tinggi kartu dihitung dari baris yang benar-benar dipakai ----
+        float pH  = padY;
+        float gT  = gapS * 0.40f;    // judul -> subjudul
+        float gS2 = gapM * 0.90f;    // subjudul -> field
+        float gN  = gapM * 0.85f;    // field/status -> tombol
+        float gB  = gapS * 1.20f;    // tombol -> footer
+        float fullH = pH * 2.0f + lineH * 4.0f + gT + gS2 + gN + gB + fieldH + btnH;
+        const float maxH = io.DisplaySize.y * 0.92f;
+        if (fullH > maxH) {
+            float k = ImMax(0.55f, maxH / fullH);
+            pH = pH * k; gT = gT * k; gS2 = gS2 * k; gN = gN * k; gB = gB * k;
+            fieldH = ImMax(lineH * 1.45f, fieldH * k);
+            btnH   = ImMax(lineH * 1.45f, btnH * k);
+            fullH = pH * 2.0f + lineH * 4.0f + gT + gS2 + gN + gB + fieldH + btnH;
+        }
+        const float cardH = XRound(ImMin(fullH, maxH));
+
+        float anim = EaseOutCubic(g_auth.cardAnim);
+        float slide = (1.0f - anim) * 20.0f * scale;
+
+        ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f + slide),
+                                ImGuiCond_Always, ImVec2(0.5f, 0.5f));
         ImGui::SetNextWindowSize(ImVec2(cardW, cardH), ImGuiCond_Always);
         ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0, 0, 0, 0));
         ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
-        ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, XRound(24.0f * S));
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
         ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
+        ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(gapS, gapS));
 
         ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
                                  ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse |
                                  ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings |
-                                 ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoBringToFrontOnFocus;
+                                 ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoBringToFrontOnFocus |
+                                 ImGuiWindowFlags_NoNav;
 
         const int vtxStart = ImGui::GetWindowDrawList()->VtxBuffer.Size;
         if (ImGui::Begin("##XloopLoginCard", nullptr, flags)) {
             ImDrawList* dl = ImGui::GetWindowDrawList();
             const ImVec2 wp = ImGui::GetWindowPos();
             const float t = (float)ImGui::GetTime();
-            const float R = XRound(24.0f * S);
-            const bool  active = g_auth.loggedIn;
-            const ImU32 accent = active ? XC_GREEN : XC_GOLD;
+            const float R = 18.0f * scale;
 
-            // ---------- background kartu ----------
-            dl->AddRectFilled(ImVec2(wp.x - 3, wp.y + 10), ImVec2(wp.x + cardW + 3, wp.y + cardH + 12), IM_COL32(0, 0, 0, 130), R + 4);
+            // latar kartu + garis aksen tipis di atas
+            dl->AddRectFilled(ImVec2(wp.x - 2, wp.y + 8), ImVec2(wp.x + cardW + 2, wp.y + cardH + 10), IM_COL32(0, 0, 0, 120), R + 3);
             dl->AddRectFilled(wp, ImVec2(wp.x + cardW, wp.y + cardH), IM_COL32(15, 14, 20, 252), R);
-
-            // panel kiri (identitas produk)
-            dl->PushClipRect(wp, ImVec2(wp.x + leftW, wp.y + cardH), true);
-            dl->AddRectFilledMultiColor(wp, ImVec2(wp.x + leftW, wp.y + cardH),
-                                        IM_COL32(44, 34, 16, 255), IM_COL32(30, 24, 14, 255),
-                                        IM_COL32(20, 18, 14, 255), IM_COL32(34, 27, 15, 255));
-            {
-                float pulse = 0.5f + 0.5f * sinf(t * 1.4f);
-                dl->AddCircleFilled(ImVec2(wp.x + leftW * 0.5f, wp.y + cardH * 0.30f),
-                                    leftW * (0.52f + 0.04f * pulse), IM_COL32(255, 184, 0, (int)(10 + 10 * pulse)), 64);
-            }
-            dl->PopClipRect();
-
-            dl->AddLine(ImVec2(wp.x + leftW, wp.y + 20.0f * S), ImVec2(wp.x + leftW, wp.y + cardH - 20.0f * S),
-                        IM_COL32(255, 245, 200, 26), 1.0f);
-            dl->AddRect(wp, ImVec2(wp.x + cardW, wp.y + cardH), Alpha(accent, 0.30f), R, 0, 1.3f);
-
-            // garis aksen tipis di tepi atas (animasi geser)
+            dl->AddRect(wp, ImVec2(wp.x + cardW, wp.y + cardH), Alpha(accent, 0.28f), R, 0, 1.2f);
             {
                 float sh = fmodf(t * 0.22f, 1.0f);
                 float x0 = wp.x + cardW * (sh * 1.4f - 0.35f);
-                dl->PushClipRect(wp, ImVec2(wp.x + cardW, wp.y + 3.0f * S), true);
-                dl->AddRectFilledMultiColor(ImVec2(x0 - 140.0f * S, wp.y), ImVec2(x0 + 140.0f * S, wp.y + 3.0f * S),
+                dl->PushClipRect(wp, ImVec2(wp.x + cardW, wp.y + 3.0f * scale), true);
+                dl->AddRectFilledMultiColor(ImVec2(x0 - 120.0f * scale, wp.y), ImVec2(x0 + 120.0f * scale, wp.y + 3.0f * scale),
                                             IM_COL32(255, 184, 0, 0), Alpha(accent, 1.0f),
                                             Alpha(accent, 1.0f), IM_COL32(255, 184, 0, 0));
                 dl->PopClipRect();
             }
 
-            // ---------- panel kiri ----------
-            {
-                float cx = wp.x + leftW * 0.5f;
-                float logoR = 30.0f * S;
-                ImVec2 lc(cx, wp.y + padY + logoR);
-                float pulse = 0.5f + 0.5f * sinf(t * 2.0f);
+            // semua posisi dihitung dari pojok kartu (koordinat layar absolut)
+            const float x = XRound(wp.x + padX);
+            float y = XRound(wp.y + pH);
 
-                dl->AddCircleFilled(lc, logoR * 1.5f, IM_COL32(255, 184, 0, (int)(14 + 18 * pulse)), 56);
-                dl->AddCircleFilled(lc, logoR, IM_COL32(28, 21, 10, 255), 48);
-                dl->AddCircle(lc, logoR, Alpha(accent, 0.90f), 48, 2.0f);
-                dl->AddCircle(lc, logoR - 1.5f * S, IM_COL32(255, 245, 200, (int)(40 + 55 * pulse)), 48, 1.0f);
-                float k = logoR * 0.40f;
-                dl->AddLine(lc - ImVec2(k, k), lc + ImVec2(k, k), IM_COL32(255, 213, 79, 255), 2.4f);
-                dl->AddLine(lc + ImVec2(k, -k), lc + ImVec2(-k, k), IM_COL32(255, 213, 79, 255), 2.4f);
+            // ---- judul + subjudul (tanpa istilah teknis) ----
+            dl->AddText(ImVec2(x, y), XC_TEXT, title);
+            y += lineH + gT;
+            dl->AddText(ImVec2(x, y), XC_DIM, FitText(subtitle, innerW).c_str());
+            y += lineH + gS2;
 
-                float ty = lc.y + logoR + 16.0f * S;
-                const char* brand = "FITURIN ENGINE";
-                float bw = ImGui::CalcTextSize(brand).x;
-                dl->AddText(ImVec2(cx - bw * 0.5f, ty), IM_COL32(255, 245, 200, 255), brand);
+            // ---- field key + tombol tempel ----
+            const float pasteW = ImGui::CalcTextSize("PASTE").x + padX * 1.3f;
+            float inputW = innerW - fieldH - pasteW - gapS * 2.0f;
+            if (inputW < ImGui::CalcTextSize("XLVP-XXXX-XXXX").x + padX)
+                inputW = ImGui::CalcTextSize("XLVP-XXXX-XXXX").x + padX;
 
-                float ty2 = ty + ImGui::GetTextLineHeight() + 6.0f * S;
-                const char* tag = "PREMIUM 8 BALL POOL";
-                float tw = ImGui::CalcTextSize(tag).x;
-                dl->AddText(ImVec2(cx - tw * 0.5f, ty2), XC_DIM, tag);
+            ImVec2 fMin(x, y), fMax(x + inputW, y + fieldH);
+            dl->AddRectFilled(fMin, fMax, XC_FIELD, 10.0f * scale);
 
-                // badge status
-                float by = ty2 + ImGui::GetTextLineHeight() + 14.0f * S;
-                const char* badge = active ? "LICENSE ACTIVE" : "LICENSE REQUIRED";
-                ImVec2 bs = ImGui::CalcTextSize(badge);
-                float bpw = bs.x + 26.0f * S, bph = bs.y + 12.0f * S;
-                ImVec2 bp(cx - bpw * 0.5f, by);
-                ImVec2 be(bp.x + bpw, bp.y + bph);
-                dl->AddRectFilled(bp, be, Alpha(accent, 0.16f), bph * 0.5f);
-                dl->AddRect(bp, be, Alpha(accent, 0.65f), bph * 0.5f, 0, 1.1f);
-                dl->AddCircleFilled(ImVec2(bp.x + 13.0f * S, bp.y + bph * 0.5f), 3.0f * S, Alpha(accent, 0.95f), 12);
-                dl->AddText(ImVec2(bp.x + 22.0f * S, bp.y + 6.0f * S), Alpha(accent, 0.95f), badge);
-
-                // fitur singkat
-                float fy = be.y + 24.0f * S;
-                float fx = wp.x + 26.0f * S;
-                DrawFeatureRow(dl, ImVec2(fx, fy), S, "Verified by Ed25519");
-                DrawFeatureRow(dl, ImVec2(fx, fy + 22.0f * S), S, "HWID locked per device");
-                DrawFeatureRow(dl, ImVec2(fx, fy + 44.0f * S), S, "Auto refresh every 10 min");
-
-                // footer kiri
-                ImGui::SetCursorScreenPos(ImVec2(wp.x + 20.0f * S, wp.y + cardH - 60.0f * S));
-                if (ThemeButton("##xloopTg", "Join  @FiturinEngine", ImVec2(leftW - 40.0f * S, 38.0f * S), false)) {
-                    OpenUrl("https://t.me/FiturinEngine");
-                }
-            }
-
-            // ---------- panel kanan ----------
-            const float rx = wp.x + leftW + padX;
-            const float rw = cardW - leftW - padX * 2.0f;
-            float y = wp.y + padY;
-
-            const char* title = active ? "LICENSE ACTIVATED" : "ENTER YOUR LICENSE KEY";
-            dl->AddText(ImVec2(rx, y), IM_COL32(240, 236, 250, 255), title);
-            y += ImGui::GetTextLineHeight() + 5.0f * S;
-            dl->AddText(ImVec2(rx, y), XC_DIM,
-                        active ? "Key tersimpan di perangkat ini. Klik continue untuk masuk menu."
-                               : "Tempel key dari reseller/owner, lalu tekan ACTIVATE.");
-            y += ImGui::GetTextLineHeight() + 18.0f * S;
-
-            float fieldH = XRound(52.0f * S);
-            float pasteW = XRound(80.0f * S);
-            float eyeW   = fieldH;
-            float inputW = rw - pasteW - eyeW - 20.0f * S;
-
-            // label (+ masked key kalau sudah aktif)
-            dl->AddText(ImVec2(rx, y), XC_DIM, "LICENSE KEY");
-            {
-                std::string hint = "Format: XLVP-XXXX-XXXX";
-                if (active && g_auth.keyInput.size() >= 14) {
-                    hint = "XLVP-****-" + g_auth.keyInput.substr(g_auth.keyInput.size() - 4);
-                }
-                ImVec2 fs = ImGui::CalcTextSize(hint.c_str());
-                dl->AddText(ImVec2(rx + rw - fs.x, y),
-                            active ? Alpha(XC_GREEN, 0.85f) : Alpha(XC_DIM, 0.75f), hint.c_str());
-            }
-            y += ImGui::GetTextLineHeight() + 8.0f * S;
-
-            ImVec2 fMin(rx, y);
-            ImVec2 fMax(rx + inputW, y + fieldH);
-            dl->AddRectFilled(fMin, fMax, XC_FIELD, 12.0f * S);
-
-            ImGui::SetCursorScreenPos(ImVec2(fMin.x + 14.0f * S, fMin.y + (fieldH - ImGui::GetTextLineHeight()) * 0.5f));
+            ImGui::SetCursorScreenPos(ImVec2(fMin.x + padX * 0.55f, fMin.y + (fieldH - lineH) * 0.5f));
             ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0, 0, 0, 0));
             ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, ImVec4(0, 0, 0, 0));
             ImGui::PushStyleColor(ImGuiCol_FrameBgActive, ImVec4(0, 0, 0, 0));
             ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.95f, 0.86f, 1.0f));
             ImGui::PushStyleColor(ImGuiCol_TextDisabled, ImVec4(0.45f, 0.44f, 0.52f, 1.0f));
-            ImGui::PushStyleColor(ImGuiCol_NavHighlight, ImVec4(0, 0, 0, 0));
             ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(0, 0));
-            ImGui::PushItemWidth(inputW - 28.0f * S);
+            ImGui::PushItemWidth(inputW - padX * 1.1f);
 
             char buf[128];
             snprintf(buf, sizeof(buf), "%s", g_auth.keyInput.c_str());
-            ImGuiInputTextFlags iflags = ImGuiInputTextFlags_CharsUppercase | ImGuiInputTextFlags_AutoSelectAll |
+            ImGuiInputTextFlags iflags = ImGuiInputTextFlags_CharsUppercase |
+                                         ImGuiInputTextFlags_AutoSelectAll |
                                          ImGuiInputTextFlags_EnterReturnsTrue;
             if (!g_auth.showKey) iflags |= ImGuiInputTextFlags_Password;
             if (g_auth.wantFocusInput) { ImGui::SetKeyboardFocusHere(); g_auth.wantFocusInput = false; }
 
-            bool submitted = ImGui::InputTextWithHint("##xloopKeyField", "XLVP-XXXX-XXXX", buf, sizeof(buf), iflags);
+            bool submitted = ImGui::InputTextWithHint("##xloopKeyField", "Tempel key di sini", buf, sizeof(buf), iflags);
             bool fieldActive = ImGui::IsItemActive();
             bool fieldHovered = ImGui::IsItemHovered();
-            g_auth.keyInput = buf;                      // selalu sinkron (paste keyboard dsb.)
+            g_auth.keyInput = buf;
             if (ImGui::IsItemDeactivatedAfterEdit()) {
                 g_auth.keyInput = NormalizeKey(g_auth.keyInput);
                 if (g_auth.keyInput.size() > sizeof(buf) - 1) g_auth.keyInput.resize(sizeof(buf) - 1);
@@ -622,160 +654,123 @@ inline void DrawLoginUI(ImGuiIO& io) {
 
             ImGui::PopItemWidth();
             ImGui::PopStyleVar();
-            ImGui::PopStyleColor(6);
+            ImGui::PopStyleColor(5);
 
-            ImU32 border = fieldActive  ? Alpha(active ? XC_GREEN : XC_GOLD_SOFT, 0.95f)
-                         : fieldHovered ? Alpha(active ? XC_GREEN : XC_GOLD, 0.65f)
+            ImU32 border = fieldActive  ? Alpha(accent, 0.95f)
+                         : fieldHovered ? Alpha(accent, 0.62f)
                          : Alpha(XC_STROKE, 1.0f);
-            dl->AddRect(fMin, fMax, border, 12.0f * S, 0, fieldActive ? 1.6f : 1.2f);
-            if (fieldActive)
-                dl->AddRectFilled(ImVec2(fMin.x + 10.0f * S, fMax.y - 2.0f * S),
-                                  ImVec2(fMax.x - 10.0f * S, fMax.y), Alpha(active ? XC_GREEN : XC_GOLD, 0.75f), 1.0f);
+            dl->AddRect(fMin, fMax, border, 10.0f * scale, 0, fieldActive ? 1.6f : 1.2f);
 
-            // tombol mata
-            ImVec2 eyeC(fMax.x + 8.0f * S + eyeW * 0.5f, fMin.y + fieldH * 0.5f);
-            ImGui::SetCursorScreenPos(ImVec2(eyeC.x - eyeW * 0.5f, eyeC.y - fieldH * 0.5f));
-            if (CircleIconButton("##xloopEye", eyeC, eyeW * 0.5f, 0, false)) {
+            // tombol mata show/hide
+            ImGui::SetCursorScreenPos(ImVec2(fMax.x + gapS, fMin.y));
+            if (CircleIconButton("##xloopEye", ImVec2(fMax.x + gapS, fMin.y), fieldH, 0, false))
                 g_auth.showKey = !g_auth.showKey;
-            }
 
-            // tombol paste
-            ImGui::SetCursorScreenPos(ImVec2(fMax.x + eyeW + 12.0f * S, fMin.y));
+            // tombol tempel key dari clipboard
+            ImGui::SetCursorScreenPos(ImVec2(fMax.x + gapS * 2.0f + fieldH, fMin.y));
             if (ThemeButton("##xloopPaste", "PASTE", ImVec2(pasteW, fieldH), false, g_auth.checking)) {
-                const char* clip = ImGui::GetClipboardText();
-                std::string pasted = clip ? NormalizeKey(clip) : std::string();
+                std::string pasted = NormalizeKey(ReadClipboard());
                 if (pasted.empty()) {
-                    SetToast("Clipboard is empty. Copy your key first", false);
+                    SetToast("Belum ada teks yang di-copy", false);
                 } else if (MatchesKeyRegex(pasted)) {
                     g_auth.keyInput = pasted;
-                    SetToast("Key pasted from clipboard", true);
+                    SetToast("Key ditempel", true);
                 } else {
                     g_auth.keyInput = pasted;
-                    SetToast("Clipboard is not a XLVP-XXXX-XXXX key", false);
+                    SetToast("Yang di-copy bukan key", false);
                     g_auth.wantFocusInput = true;
                 }
             }
+            y = fMax.y + gapS;
 
-            y = fMax.y + 14.0f * S;
-
-            // ---------- status / info ----------
-            float statusH = XRound(44.0f * S);
-            ImVec2 stMin(rx, y);
-            ImVec2 stMax(rx + rw, y + statusH);
-            float iconCx = stMin.x + 22.0f * S;
-            float iconCy = (stMin.y + stMax.y) * 0.5f;
-
-            if (g_auth.checking) {
-                dl->AddRectFilled(stMin, stMax, IM_COL32(255, 184, 0, 18), 11.0f * S);
-                dl->AddRect(stMin, stMax, IM_COL32(255, 184, 0, 70), 11.0f * S, 0, 1.0f);
-                dl->AddCircle(ImVec2(iconCx, iconCy), 7.5f * S, IM_COL32(255, 184, 0, 60), 24, 2.0f);
-                dl->PathArcTo(ImVec2(iconCx, iconCy), 7.5f * S, t * 4.5f, t * 4.5f + 4.2f, 20);
-                dl->PathStroke(IM_COL32(255, 213, 79, 255), 0, 2.0f);
-                dl->AddText(ImVec2(iconCx + 16.0f * S, iconCy - ImGui::GetTextLineHeight() * 0.5f),
-                            IM_COL32(255, 213, 79, 255), "Verifying with license server...");
-                float pw = (stMax.x - stMin.x) * ImClamp(g_auth.progress, 0.0f, 1.0f);
-                dl->AddRectFilled(ImVec2(stMin.x, stMax.y - 2.0f * S), ImVec2(stMin.x + pw, stMax.y), IM_COL32(255, 184, 0, 190), 1.0f);
-            } else if (g_auth.loggedIn) {
-                dl->AddRectFilled(stMin, stMax, Alpha(XC_GREEN, 0.09f), 11.0f * S);
-                dl->AddRect(stMin, stMax, Alpha(XC_GREEN, 0.40f), 11.0f * S, 0, 1.0f);
-                dl->AddCircleFilled(ImVec2(iconCx, iconCy), 8.5f * S, XC_GREEN, 24);
-                dl->AddLine(ImVec2(iconCx - 4.2f * S, iconCy), ImVec2(iconCx - 1.0f * S, iconCy + 3.2f * S), IM_COL32(16, 30, 20, 255), 2.0f);
-                dl->AddLine(ImVec2(iconCx - 1.0f * S, iconCy + 3.2f * S), ImVec2(iconCx + 4.6f * S, iconCy - 3.6f * S), IM_COL32(16, 30, 20, 255), 2.0f);
-                dl->AddText(ImVec2(iconCx + 16.0f * S, iconCy - ImGui::GetTextLineHeight() * 0.5f),
-                            Alpha(XC_GREEN, 1.25f), g_auth.message.c_str());
-            } else if (g_auth.hasResult) {
-                dl->AddRectFilled(stMin, stMax, Alpha(XC_RED, 0.10f), 11.0f * S);
-                dl->AddRect(stMin, stMax, Alpha(XC_RED, 0.45f), 11.0f * S, 0, 1.0f);
-                dl->AddCircleFilled(ImVec2(iconCx, iconCy), 8.5f * S, XC_RED, 24);
-                float k = 3.8f * S;
-                dl->AddLine(ImVec2(iconCx - k, iconCy - k), ImVec2(iconCx + k, iconCy + k), IM_COL32(34, 14, 12, 255), 2.0f);
-                dl->AddLine(ImVec2(iconCx + k, iconCy - k), ImVec2(iconCx - k, iconCy + k), IM_COL32(34, 14, 12, 255), 2.0f);
-                dl->AddText(ImVec2(iconCx + 16.0f * S, iconCy - ImGui::GetTextLineHeight() * 0.5f),
-                            IM_COL32(234, 154, 146, 255), g_auth.message.c_str());
-            } else {
-                dl->AddRectFilled(stMin, stMax, IM_COL32(255, 255, 255, 7), 11.0f * S);
-                dl->AddCircle(ImVec2(iconCx, iconCy), 7.5f * S, Alpha(XC_DIM, 1.0f), 24, 1.4f);
-                dl->AddText(ImVec2(iconCx + 16.0f * S, iconCy - ImGui::GetTextLineHeight() * 0.5f),
-                            XC_DIM, "Key terikat ke device ini (HWID). Jangan dibagikan.");
+            // ---- satu baris kecil: status / masa aktif (opsional, tanpa istilah teknis) ----
+            {
+                std::string note;
+                ImU32 noteCol = XC_DIM;
+                if (g_auth.checking) {
+                    note = g_auth.message.empty() ? "Mengecek key..." : g_auth.message;
+                    noteCol = IM_COL32(255, 213, 79, 255);
+                } else if (active) {
+                    std::string d = ShortExpiry(g_auth.expiredText);
+                    note = d.empty() ? "Masa aktifmu masih jalan" : ("Aktif sampai " + d);
+                    noteCol = Alpha(XC_GREEN, 0.95f);
+                } else if (g_auth.hasResult && !g_auth.message.empty()) {
+                    note = g_auth.message;
+                    noteCol = IM_COL32(234, 154, 146, 255);
+                }
+                if (!note.empty())
+                    dl->AddText(ImVec2(x, y), noteCol, FitText(note, innerW).c_str());
+                y += lineH + gN;
             }
 
-            y = stMax.y + 14.0f * S;
-
-            // ---------- tombol utama ----------
-            char primary[64];
-            if (g_auth.checking)      snprintf(primary, sizeof(primary), "VERIFYING...");
-            else if (g_auth.loggedIn) snprintf(primary, sizeof(primary), "CONTINUE TO MENU");
-            else                      snprintf(primary, sizeof(primary), "ACTIVATE LICENSE");
-
-            ImGui::SetCursorScreenPos(ImVec2(rx, y));
-            if (ThemeButton("##xloopPrimary", primary, ImVec2(rw, XRound(52.0f * S)), true, g_auth.checking)) {
-                if (g_auth.loggedIn) g_auth.cardAnim = 0.0f;
-                else                 StartVerify(g_auth.keyInput, false);
+            // ---- tombol utama ----
+            ImGui::SetCursorScreenPos(ImVec2(x, y));
+            if (ThemeButton("##xloopPrimary", primary, ImVec2(innerW, btnH), true, g_auth.checking)) {
+                if (active) g_auth.cardAnim = 0.0f;
+                else        StartVerify(g_auth.keyInput, false);
             }
             if (submitted && !g_auth.checking) {
-                if (g_auth.loggedIn) g_auth.cardAnim = 0.0f;
-                else                 StartVerify(g_auth.keyInput, false);
+                if (active) g_auth.cardAnim = 0.0f;
+                else        StartVerify(g_auth.keyInput, false);
             }
-            y += XRound(52.0f * S) + 12.0f * S;
+            y = XRound(y + btnH + gB);
 
-            // ---------- baris info kecil ----------
+            // ---- footer kecil: brand + bantuan ----
             {
-                std::string hwid = HardwareId();
-                std::string shortHwid = hwid.size() > 34 ? hwid.substr(0, 34) + ".." : hwid;
-                dl->AddText(ImVec2(rx, y), XC_DIM, "DEVICE");
-                dl->AddText(ImVec2(rx + 62.0f * S, y), Alpha(XC_MUTED, 0.9f), shortHwid.c_str());
+                const char* brand = "@FiturinEngine";
+                const char* ask   = "Butuh key? ";
+                const char* act   = "Chat owner";
+                float brandW = ImGui::CalcTextSize(brand).x;
+                float askW   = ImGui::CalcTextSize(ask).x;
+                float actW   = ImGui::CalcTextSize(act).x;
+                float needW  = brandW + gapM + askW + actW;
 
-                if (g_auth.expiredEpoch > 0 || g_auth.loggedIn) {
-                    const char* ex = g_auth.expiredText.empty() ? "N/A" : g_auth.expiredText.c_str();
-                    float ew = ImGui::CalcTextSize(ex).x;
-                    dl->AddText(ImVec2(rx + rw - ew, y), Alpha(active ? XC_GREEN : XC_GOLD_SOFT, 0.95f), ex);
-                }
-
-                float ownerY = y + ImGui::GetTextLineHeight() + 10.0f * S;
-                const char* ask = "Belum punya key? ";
-                const char* act = "Chat owner";
-                dl->AddText(ImVec2(rx, ownerY), Alpha(XC_MUTED, 0.85f), ask);
-                float ax = rx + ImGui::CalcTextSize(ask).x;
-                dl->AddText(ImVec2(ax, ownerY), Alpha(XC_GOLD, 0.95f), act);
-                ImVec2 aMin(ax, ownerY);
-                ImVec2 aMax(ax + ImGui::CalcTextSize(act).x, ownerY + ImGui::GetTextLineHeight());
-                if (ImGui::IsMouseHoveringRect(aMin, aMax)) {
-                    dl->AddLine(ImVec2(aMin.x, aMax.y + 1.0f), ImVec2(aMax.x, aMax.y + 1.0f), Alpha(XC_GOLD, 0.85f), 1.0f);
+                float actX = x + innerW - actW;
+                float askX = actX - askW;
+                dl->AddText(ImVec2(askX, y), Alpha(XC_MUTED, 0.80f), ask);
+                dl->AddText(ImVec2(actX, y), Alpha(XC_GOLD, 0.95f), act);
+                if (ImGui::IsMouseHoveringRect(ImVec2(actX, y), ImVec2(actX + actW, y + lineH))) {
+                    dl->AddLine(ImVec2(actX, y + lineH + 1.0f), ImVec2(actX + actW, y + lineH + 1.0f), Alpha(XC_GOLD, 0.8f), 1.0f);
                     if (io.MouseReleased[0]) OpenUrl("https://t.me/axell_08");
                 }
-
-                // footer kanan
-                const char* powered = "Powered by XLOOP PANEL  -  Ed25519 signed";
-                ImVec2 ps = ImGui::CalcTextSize(powered);
-                dl->AddText(ImVec2(rx + rw - ps.x, wp.y + cardH - 26.0f * S), Alpha(XC_DIM, 0.75f), powered);
+                if (needW <= innerW) {
+                    dl->AddText(ImVec2(x, y), Alpha(XC_GOLD, 0.85f), brand);
+                    if (ImGui::IsMouseHoveringRect(ImVec2(x, y), ImVec2(x + brandW, y + lineH))) {
+                        dl->AddLine(ImVec2(x, y + lineH + 1.0f), ImVec2(x + brandW, y + lineH + 1.0f), Alpha(XC_GOLD, 0.7f), 1.0f);
+                        if (io.MouseReleased[0]) OpenUrl("https://t.me/FiturinEngine");
+                    }
+                } else {
+                    dl->AddText(ImVec2(x, y), Alpha(XC_GOLD, 0.85f), brand);
+                }
             }
 
-            // Fade kartu: kalikan alpha semua vertex kartu di frame ini supaya
-            // animasi masuk/keluar berlaku juga untuk drawing manual di atas.
+            // fade animasi masuk/keluar untuk semua vertex kartu
             if (alpha < 0.999f) {
-                ImDrawList* cdl = ImGui::GetWindowDrawList();
-                for (int i = vtxStart; i < cdl->VtxBuffer.Size; ++i) {
-                    ImU32 c = cdl->VtxBuffer[i].col;
+                for (int i = vtxStart; i < dl->VtxBuffer.Size; ++i) {
+                    ImU32 c = dl->VtxBuffer[i].col;
                     ImU32 a = (ImU32)(((c >> IM_COL32_A_SHIFT) & 0xFF) * alpha);
-                    cdl->VtxBuffer[i].col = (c & ~IM_COL32_A_MASK) | (a << IM_COL32_A_SHIFT);
+                    dl->VtxBuffer[i].col = (c & ~IM_COL32_A_MASK) | (a << IM_COL32_A_SHIFT);
                 }
             }
         }
         ImGui::End();
-        ImGui::PopStyleVar(3);
+        ImGui::PopStyleVar(4);
         ImGui::PopStyleColor();
     }
 
     // ---------- toast mengapung ----------
     if (g_auth.toastTimer > 0.0f && !g_auth.toast.empty()) {
-        float a = ImClamp(g_auth.toastTimer / 0.55f, 0.0f, 1.0f);
-        ImVec2 ts = ImGui::CalcTextSize(g_auth.toast.c_str());
-        float round = 14.0f * S;
-        ImVec2 tMin(io.DisplaySize.x * 0.5f - ts.x * 0.5f - 26.0f * S, io.DisplaySize.y - 54.0f * S - 22.0f * S);
-        ImVec2 tMax(tMin.x + ts.x + 52.0f * S, tMin.y + ts.y + 24.0f * S);
+        const float a = ImClamp(g_auth.toastTimer / 0.55f, 0.0f, 1.0f);
+        const float lineH = ImGui::GetTextLineHeight();
+        std::string msg = FitText(g_auth.toast, io.DisplaySize.x * 0.80f);
+        ImVec2 ts = ImGui::CalcTextSize(msg.c_str());
+        const float round = 12.0f * scale;
+        const float padT = XRound(lineH * 0.42f);
+        ImVec2 tMin(io.DisplaySize.x * 0.5f - ts.x * 0.5f - padT * 2.4f, io.DisplaySize.y - 34.0f * scale - ts.y - padT * 2.0f);
+        ImVec2 tMax(tMin.x + ts.x + padT * 4.8f, tMin.y + ts.y + padT * 2.0f);
 
-        ImGui::SetNextWindowPos(ImVec2(tMin.x - 40.0f, tMin.y - 30.0f), ImGuiCond_Always);
-        ImGui::SetNextWindowSize(ImVec2(tMax.x - tMin.x + 80.0f, tMax.y - tMin.y + 60.0f), ImGuiCond_Always);
+        ImGui::SetNextWindowPos(ImVec2(tMin.x - 10.0f, tMin.y - 10.0f), ImGuiCond_Always);
+        ImGui::SetNextWindowSize(ImVec2(tMax.x - tMin.x + 20.0f, tMax.y - tMin.y + 20.0f), ImGuiCond_Always);
         ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0, 0, 0, 0));
         ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
         if (ImGui::Begin("##xloopToast", nullptr,
@@ -785,14 +780,11 @@ inline void DrawLoginUI(ImGuiIO& io) {
                          ImGuiWindowFlags_NoBackground)) {
             ImDrawList* dl = ImGui::GetWindowDrawList();
             ImU32 accent = F4(g_auth.toastColor[0], g_auth.toastColor[1], g_auth.toastColor[2], 1.0f);
-
             dl->AddRectFilled(ImVec2(tMin.x + 2, tMin.y + 6), ImVec2(tMax.x + 2, tMax.y + 6), IM_COL32(0, 0, 0, (int)(110 * a)), round);
             dl->AddRectFilled(tMin, tMax, IM_COL32(24, 22, 32, (int)(246 * a)), round);
             dl->AddRect(tMin, tMax, Alpha(accent, a * 0.65f), round, 0, 1.2f);
-            dl->AddRectFilled(ImVec2(tMin.x + 12.0f * S, tMin.y + 8.0f * S),
-                              ImVec2(tMin.x + 15.0f * S, tMax.y - 8.0f * S), Alpha(accent, a * 0.85f), 1.5f);
-            dl->AddCircleFilled(ImVec2(tMin.x + 26.0f * S, (tMin.y + tMax.y) * 0.5f), 3.4f * S, Alpha(accent, a), 16);
-            dl->AddText(ImVec2(tMin.x + 36.0f * S, tMin.y + 12.0f * S), Alpha(accent, a), g_auth.toast.c_str());
+            dl->AddCircleFilled(ImVec2(tMin.x + padT * 1.5f, (tMin.y + tMax.y) * 0.5f), 3.2f * scale, Alpha(accent, a), 16);
+            dl->AddText(ImVec2(tMin.x + padT * 2.6f, tMin.y + padT), Alpha(accent, a), msg.c_str());
         }
         ImGui::End();
         ImGui::PopStyleVar();

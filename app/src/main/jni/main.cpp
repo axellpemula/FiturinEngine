@@ -95,6 +95,13 @@ void __1__() {
     // Baca session lisensi lebih awal supaya menu tidak sempat tampil
     // sebelum status login diketahui.
     xloop::SetAndroidIdProvider(&XloopAndroidId);
+    // Tombol PASTE di kartu login: backend ImGui Android tidak punya clipboard,
+    // jadi kita suplai lewat JNI (ClipboardManager). Lihat include/java.h.
+    xloop::SetClipboardProvider([]() -> std::string {
+        JNIEnv* env = GetJNIEnv();
+        if (!env) return std::string();
+        return getClipboard(env);
+    });
     xloop::BootAuth();
     LOGI("cmdline: %s", PACKAGE_NAME.c_str());
     

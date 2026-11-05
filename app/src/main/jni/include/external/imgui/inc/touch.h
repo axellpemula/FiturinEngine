@@ -21,6 +21,8 @@ bool ShouldConsumeTouch(AInputEvent *inputEvent) {
     int32_t pointer_count = AMotionEvent_getPointerCount(inputEvent);
     if (pointer_index < 0 || pointer_index >= pointer_count) return false;
     if (pointer_index != 0) return false;
+    // Tap tidak valid harus tetap diteruskan ke game, jangan "dimakan".
+    if (!ImGui::GetCurrentContext()) return false;
     
     float x = AMotionEvent_getRawX(inputEvent, pointer_index);
     float y = AMotionEvent_getRawY(inputEvent, pointer_index);
