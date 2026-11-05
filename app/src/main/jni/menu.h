@@ -19,7 +19,7 @@ using namespace std;
 #include "game.h"
 #include "game/Ruleset.h"
 #include "imgui/inc/8bp.h"
-#include "mod/keylogin.h"
+#include "mod/xloop/auth_ui.h"
 #include "oxorany/oxorany.h"
 
 #include <EGL/egl.h>
@@ -880,6 +880,11 @@ static float GetBallLineThickness(int i, bool isScanning) {
 
 INLINE void DrawESP(ImDrawList* draw) {
     {
+        // Gate #1: fitur visual (ESP/prediction) tidak boleh jalan tanpa lisensi.
+        if (!xloop::RequireLicense("esp")) {
+            if (g_menu.isOpen) g_menu.isOpen = false;
+            return;
+        }
         if (!sharedGameManager) return;
         UpdateScreenTable();
         if (!g_Vault.is_loaded) {
@@ -930,7 +935,13 @@ INLINE void DrawESP(ImDrawList* draw) {
         GameStateManager gameStateManager = sharedGameManager.mStateManager;
         if (!gameStateManager) return;
 
-        AutoPlay::Update();
+        // Gate #2: sebelum auto play/auto aim melakukan aksi.
+        if (xloop::RequireLicense("autoplay")) {
+            AutoPlay::Update();
+        } else {
+            AutoPlay::bAutoPlaying = false;
+            AutoPlay::currentMode = AutoPlay::MODE_OFF;
+        }
 
         auto stateId = gameStateManager.getCurrentStateId();
         if (stateId == 4 && (AutoPlay::currentMode == AutoPlay::MODE_OFF || AutoPlay::state != AutoPlay::SCANNING)) {
@@ -1645,6 +1656,10 @@ case 1: {
     TextColored(ImVec4(1.0f, 0.85f, 0.4f, 1.0f), L("AUTOMATION CONTROL", "АВТОМАТИЗАЦИЯ"));
     if (g_ArialBlackFont) PopFont();
     if (ToggleSwitch(L("Auto Play Mode", "Режим автоигры"), &persistent_bool[O("bAutoPlaySwitch")])) {
+        // Gate #3: toggle fitur utama butuh lisensi valid.
+        if (persistent_bool[O("bAutoPlaySwitch")] && !xloop::RequireLicense("toggle_autoplay")) {
+            persistent_bool[O("bAutoPlaySwitch")] = false;
+        }
         AutoPlay::bAutoPlaySwitch = persistent_bool[O("bAutoPlaySwitch")];
         if (AutoPlay::bAutoPlaySwitch) {
             persistent_bool[O("bAutoAimSwitch")] = false;
@@ -1657,6 +1672,9 @@ case 1: {
     }
     Dummy(ImVec2(0, 8));
     if (ToggleSwitch(L("Auto Aim Mode", "Режим автоприцела"), &persistent_bool[O("bAutoAimSwitch")])) {
+        if (persistent_bool[O("bAutoAimSwitch")] && !xloop::RequireLicense("toggle_autoaim")) {
+            persistent_bool[O("bAutoAimSwitch")] = false;
+        }
         AutoPlay::bAutoAimSwitch = persistent_bool[O("bAutoAimSwitch")];
         if (AutoPlay::bAutoAimSwitch) {
             persistent_bool[O("bAutoPlaySwitch")] = false;
@@ -1943,11 +1961,16 @@ case 4: {
     {
         float avail = GetContentRegionAvail().x;
 
-        DrawInfoRow(L("Status: ", "Статус:   "), L("Activated", "Активировано"), amber);
+        bool licOk = xloop::IsLoggedIn();
+        DrawInfoRow(L("Status: ", "Статус:   "),
+                    licOk ? L("Activated", "Активировано") : L("Not activated", "Не активировано"),
+                    licOk ? amber : red);
         DrawInfoRow(L("Key:    ", "Ключ:     "),
-                    g_Key.empty() ? "PREMIUM-UNLOCKED" : g_Key.c_str(), green);
+                    g_Key.empty() ? "N/A" : g_Key.c_str(), green);
         DrawInfoRow(L("Seller: ", "Продавец: "),
                     g_Reseller.empty() ? "FITURIN SYSTEM" : g_Reseller.c_str(), gold);
+        DrawInfoRow(L("Expires:", "Истекает: "), xloop::ExpiryText().c_str(), amber);
+        (void)avail;
 
         Dummy(ImVec2(0, 10));
     }
@@ -2104,6 +2127,29 @@ static void DrawToasts(ImDrawList* draw) {
 
         draw->AddText(font, fontSize, ImVec2(x + paddingX, y + paddingY), textCol, t.text.c_str(), NULL, 0.0f, NULL);
     }
+}
+
+// Sinkronkan variabel global lama (g_Key / g_Reseller / g_ExpiryTime) dengan
+// state lisensi XLOOP, supaya Info tab, countdown header, dan MenuColor JNI
+// selalu memakai data hasil validasi terakhir.
+static void SyncLicenseGlobals() {
+    static bool    lastLogged = false;
+    static int64_t lastExpiry = -1;
+
+    bool    logged = xloop::IsLoggedIn();
+    int64_t expiry = xloop::ExpiryEpoch();
+
+    if (!logged) g_menu.isOpen = false;
+
+    if (logged == lastLogged && expiry == lastExpiry) return;
+    lastLogged = logged;
+    lastExpiry = expiry;
+
+    g_Key      = xloop::CurrentKey();
+    g_Reseller = xloop::ResellerText();
+    g_ExpiryTime = expiry > 0 ? expiry
+                 : (logged ? (int64_t)time(nullptr) + (3650LL * 24 * 3600) : (int64_t)time(nullptr));
+    g_AuthToken  = logged ? (0xDEADBEEFCAFEBABEULL ^ (uint64_t)g_ExpiryTime) : 0ULL;
 }
 
 INLINE void DrawMenu(ImGuiIO& io) {
@@ -2410,7 +2456,10 @@ static void DrawFloatingButton(ImGuiIO& io) {
                 AutoPlay::currentMode = AutoPlay::MODE_OFF;
             }
         }
-        if (logoClicked) g_menu.isOpen = !g_menu.isOpen;
+        if (logoClicked) {
+            if (xloop::IsLoggedIn()) g_menu.isOpen = !g_menu.isOpen;
+            else g_menu.isOpen = false;   // kartu login yang tampil
+        }
     }
     End();
     PopStyleVar(2);
@@ -2425,8 +2474,13 @@ INLINE void SetupImgui() {
     switch_theme(current_theme);
     load_persistence();
 
-    g_ExpiryTime = (int64_t)time(nullptr) + (365LL * 24 * 3600);
-    g_AuthToken  = 0xDEADBEEFCAFEBABEULL ^ (uint64_t)g_ExpiryTime;
+    xloop::BootAuth();
+    g_ExpiryTime = xloop::ExpiryEpoch() > 0 ? xloop::ExpiryEpoch()
+                  : (xloop::IsLoggedIn() ? (int64_t)time(nullptr) + (3650LL * 24 * 3600)
+                                         : (int64_t)time(nullptr));
+    g_AuthToken  = xloop::IsLoggedIn() ? (0xDEADBEEFCAFEBABEULL ^ (uint64_t)g_ExpiryTime) : 0ULL;
+    g_Key        = xloop::CurrentKey();
+    g_Reseller   = xloop::ResellerText();
 
     AutoPlay::bAutoPlaySwitch = persistent_bool[O("bAutoPlaySwitch")];
     AutoPlay::bAutoAimSwitch  = persistent_bool[O("bAutoAimSwitch")];
@@ -2643,11 +2697,20 @@ DEFINES(EGLBoolean, Draw, EGLDisplay dpy, EGLSurface surface) {
     if (!is_segv_handler_active()) setup_global_segv_handler();
 
     {
-        DrawFloatingButton(io);
-        DrawMenu(io);
-        DrawToggleButton(false);
+        // Kartu lisensi XLOOP selalu digambar terakhir supaya di atas menu.
+        SyncLicenseGlobals();
+
+        // Selama lisensi belum aktif, UI menu disembunyikan penuh dan hanya
+        // kartu aktivasi XLOOP yang tampil (tidak bisa Di-tap / bypass).
+        const bool lockScreen = !xloop::IsLoggedIn() && xloop::g_auth.cardAnim > 0.95f;
+        if (!lockScreen) {
+            DrawFloatingButton(io);
+            DrawMenu(io);
+            DrawToggleButton(false);
+        }
         DrawFPSCounter(io);
         DrawResolutionText(io, Width, Height);
+        xloop::DrawLoginUI(io);
 
         static bool lastState = true;
         bool currentState = g_menu.isOpen || g_aqCounting;

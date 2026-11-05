@@ -10,9 +10,20 @@
 #include "include/random_defs.h"
 #include "include/Security.h"
 #include "menu.h"
+#include "mod/xloop/auth_ui.h"
 #include "MemoryPatch.h"
 #include <netdb.h>
 //Original src For free by @xvaluex : @FiturinEngine.
+
+// HWID: suntikkan ANDROID_ID asli (lewat JNI) ke license_core tanpa membuat
+// file itu bergantung pada java.h (java.h hanya boleh di-include sekali).
+static std::string XloopAndroidId() {
+    static std::string cached;
+    if (!cached.empty()) return cached;
+    std::string id = getAndroidID();
+    if (!id.empty()) cached = id;
+    return cached;
+}
 
 int64_t g_ExpiryTime = 0;
 uint64_t g_AuthToken = 0;
@@ -26,62 +37,33 @@ std::string ERROR_MESSAGE = "";
 std::string g_Token = "";
 std::string g_Auth = "";
 
+// Login lama (endpoint kosong, response "success" plain) sudah tidak dipakai.
+// Semua autentikasi sekarang lewat XLOOP PANEL /api/validate yang
+// ditandatangani Ed25519 -> lihat mod/xloop/license_core.h + auth_ui.h.
 void Login(const std::string& hwid, const std::string& key) {
+    (void)hwid;
     is_logging_in = true;
     ERROR_MESSAGE = "";
     ERROR_CODE = 0;
-    
-    std::thread([hwid, key]() {
-        CURL* curl;
-        CURLcode res;
-        std::string readBuffer;
 
-        curl = curl_easy_init();
-        if (curl) {
-            curl_easy_setopt(curl, CURLOPT_URL, "https://");
-            
-            struct curl_slist* headers = NULL;
-            headers = curl_slist_append(headers, "Content-Type: application/json");
-            headers = curl_slist_append(headers, "Accept: application/json");
-            curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-
-            std::string jsonData = "{\"key\": \"" + key + "\", \"hwid\": \"" + hwid + "\", \"game\": \"AimX8bp\"}";
-            
-            curl_easy_setopt(curl, CURLOPT_POSTFIELDS, jsonData.c_str());
-            curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, EngineAuth::WriteCallback);
-            curl_easy_setopt(curl, CURLOPT_WRITEDATA, &readBuffer);
-            curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
-
-            res = curl_easy_perform(curl);
-            
-            if (res == CURLE_OK) {
-                if (readBuffer.find("\"success\":true") != std::string::npos || readBuffer.find("\"success\": true") != std::string::npos) {
-                    g_Key = key;
-                    g_ExpiryTime = (int64_t)time(nullptr) + (7LL * 24LL * 3600LL);
-                    g_AuthToken = (uint64_t)g_ExpiryTime ^ 0xDEADBEEFCAFEBABE;
-                    g_ExpTime = formatTimestamp(g_ExpiryTime);
-                    g_isTrial = false;
-                    g_Token = "Only_declarations ";
-                    g_Auth = "Only_declarations";
-                    
-                    persistent_string["key"] = key;
-                    save_persistence();
-                    
-                    g_menu.showLanguageSelector = true;
-                    g_menu.isOpen = false;
-                } else {
-                    std::string serverMsg = EngineAuth::ExtractJsonString(readBuffer, "message");
-                    if (serverMsg.empty()) serverMsg = "Invalid or expired key";
-                    ERROR_MESSAGE = serverMsg;
-                    ERROR_CODE = 1;
-                }
-            } else {
-                ERROR_MESSAGE = "Failed to connect to server";
-                ERROR_CODE = 2;
-            }
-            
-            curl_slist_free_all(headers);
-            curl_easy_cleanup(curl);
+    std::thread([key]() {
+        xloop::Result r = xloop::VerifyKey(key);
+        if (r.ok) {
+            g_Key = r.key;
+            g_Reseller = r.reseller;
+            g_ExpiryTime = r.expiredEpoch > 0 ? r.expiredEpoch : (int64_t)time(nullptr) + (3650LL * 24 * 3600);
+            g_AuthToken = 0xDEADBEEFCAFEBABEULL ^ (uint64_t)g_ExpiryTime;
+            g_ExpTime = formatTimestamp(g_ExpiryTime);
+            g_isTrial = false;
+            g_Token = "xloop-ed25519";
+            g_Auth = "xloop-ed25519";
+            persistent_string["key"] = r.key;
+            save_persistence();
+            g_menu.showLanguageSelector = true;
+            g_menu.isOpen = false;
+        } else {
+            ERROR_MESSAGE = r.message;
+            ERROR_CODE = 1;
         }
         is_logging_in = false;
     }).detach();
@@ -109,6 +91,11 @@ void __1__() {
     sleep(2);
 
     PACKAGE_NAME = string(getcmdline());
+
+    // Baca session lisensi lebih awal supaya menu tidak sempat tampil
+    // sebelum status login diketahui.
+    xloop::SetAndroidIdProvider(&XloopAndroidId);
+    xloop::BootAuth();
     LOGI("cmdline: %s", PACKAGE_NAME.c_str());
     
     __IMGUI__();

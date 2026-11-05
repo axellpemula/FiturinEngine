@@ -28,6 +28,11 @@ LOCAL_LDFLAGS += -Wl,--strip-all
 LOCAL_ARM_MODE := arm
 
 LOCAL_SRC_FILES := main.cpp \
+    include/external/ed25519/fe.c \
+    include/external/ed25519/ge.c \
+    include/external/ed25519/sc.c \
+    include/external/ed25519/sha512.c \
+    include/external/ed25519/verify.c \
     include/external/dlfcn/dlfcn.cpp \
     include/external/imgui/imgui.cpp \
     include/external/Substrate/SubstrateHook.cpp \

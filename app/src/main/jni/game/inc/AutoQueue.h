@@ -1,5 +1,10 @@
 #pragma once
 
+// Dideklarasikan di mod/xloop/auth_ui.h. File ini di-include sebelum header
+// tersebut (lewat game.h), jadi butuh deklarasi maju. Default argument hanya
+// ditulis sekali, di definisinya.
+namespace xloop { inline bool RequireLicense(const char* where); }
+
 struct MatchInfo {
     bool set;
     string Tier;
@@ -8,6 +13,12 @@ struct MatchInfo {
 
 DEFINE(void*, StartMatch, ptr arg1, int64_t arg2, string arg3, int64_t arg4, int32_t arg5, int32_t arg6, int64_t arg7, int32_t arg8, char arg9, int32_t arg10, int32_t arg11) {
     LOGI("StartMatch");
+
+    // Gate #4: jangan biarkan match dimulai otomatis tanpa lisensi valid.
+    if (!xloop::RequireLicense("start_match")) {
+        LOGI("StartMatch blocked: license required");
+        return nullptr;
+    }
 
     LOGI("Tier %s", arg3.c_str());
     LOGI("arg4 %p, arg5 %p, arg6 %p, arg7 %p, arg8 %p, arg9 %p, arg10 %p, arg11 %p", arg4, arg5, arg6, arg7, arg8, arg9, arg10, arg11);
