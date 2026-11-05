@@ -1,0 +1,254 @@
+void AutoPlay::ScanFast(double angleStep) {
+    if (g_CurrentCandidate.idx != -1) return;
+    
+    auto& cueBall = gPrediction->guiData.balls[0];
+    double distSq = (cueBall.initialPosition - fs.scanCuePos).square();
+    
+    // إعادة التعيين إذا تحركت الكرة البيضاء أو لم يتم البدء بعد
+    if (!fs.isInitiated || distSq > 0.0025) {
+        fs.raw.clear();
+        fs.evals.clear();
+        fs.evalIndex = 0;
+        fs.scanCuePos = cueBall.initialPosition;
+        fs.isInitiated = true;
+        fs.prepPhase = 0; 
+    }
+
+    // المرحلة الأولى: توليد المرشحين (Candidate Generation)
+    // تم تقسيمها إلى مراحل لمنع تعليق اللعبة (Frame Drop)
+    if (fs.prepPhase < 8) { // زيادة عدد المراحل لتغطية زوايا أكثر
+        auto myclass = sharedGameManager.getPlayerClassification();
+        uint nominatedPocket = sharedGameManager.getNominatedPocket();
+        bool isNineBall = (myclass == Ball::Classification::NINE_BALL_RULE);
+        Table table = sharedGameManager.mTable;
+        if (!table) return;
+        auto tableProperties = table.mTableProperties();
+        if (!tableProperties) return;
+        auto& pocketArr = tableProperties.mPockets();
+        Vec2d* pockets = &pocketArr[0];
+
+        int ballsPerPhase = 2; // تقليل الكرات لكل مرحلة لزيادة الدقة في الحساب
+        int startBall = fs.prepPhase * ballsPerPhase + 1;
+        int endBall = std::min(startBall + ballsPerPhase, (int)gPrediction->guiData.ballsCount);
+        
+        for (int i = startBall; i < endBall; i++) {
+            auto& ball = gPrediction->guiData.balls[i];
+            if (!ball.originalOnTable) continue;
+
+            // تحديد ما إذا كانت الكرة هدفا قانونيا
+            bool isLegalTarget = false;
+            if (isNineBall) {
+                // في 9-ball، يجب ضرب أصغر كرة أولاً، لكن يمكن إدخال أي كرة
+                // سنفترض أن i هو الترتيب الصحيح للتبسيط هنا
+                isLegalTarget = (i == 1 || fs.raw.empty()); 
+            } else {
+                if (myclass == Ball::Classification::ANY) {
+                    isLegalTarget = (ball.classification != Ball::Classification::EIGHT_BALL);
+                } else if (myclass == Ball::Classification::EIGHT_BALL) {
+                    isLegalTarget = (i == 8);
+                } else {
+                    isLegalTarget = (ball.classification == myclass);
+                }
+            }
+            if (!isLegalTarget && !isNineBall) continue;
+
+            for (int pIdx = 0; pIdx < 6; pIdx++) {
+                if (nominatedPocket < 6 && pIdx != nominatedPocket) continue;
+                
+                // 1. الضرب المباشر (Direct Shots)
+                {
+                    Point2D toPocket = pockets[pIdx] - ball.initialPosition;
+                    double distP = sqrt(toPocket.square());
+                    if (distP > 0.1) {
+                        Point2D ghost = ball.initialPosition - (toPocket * (1.0 / distP)) * (2.0 * BALL_RADIUS);
+                        Point2D shot = ghost - cueBall.initialPosition;
+                        double distC = sqrt(shot.square());
+                        double angle = atan2(shot.y, shot.x);
+                        
+                        double basePower = CalculateRequiredPower(distC + distP);
+                        // تجربة 5 مستويات قوة بدلاً من 3 لضمان تجاوز العقبات أو التحكم في التمركز
+                        double powerSteps[] = { basePower * 0.85, basePower * 0.95, basePower, basePower * 1.1, basePower * 1.25 };
+                        for (double p : powerSteps) {
+                            double finalP = p;
+                            if (cleanTableMode == CLEAN_ALL_BALLS) finalP = powerMax;
+                            else { 
+                                if (finalP > powerMax) finalP = powerMax; 
+                                if (finalP < powerMin) finalP = powerMin; 
+                            }
+                            // إضافة وزن للمسافة: المسافات الأقصر أفضل
+                            fs.raw.push_back({i, angle, 0, pIdx, finalP, distC + distP});
+                        }
+                    }
+                }
+
+                // 2. ضربات الارتداد (Bank Shots) - تم تطويرها لتكون أكثر دقة
+                if (bCushionShot) {
+                    for (int side = 0; side < 4; side++) {
+                        Point2D mp;
+                        // حساب نقاط المرآة بدقة للطاولة القياسية
+                        switch(side) {
+                            case 0: mp = {pockets[pIdx].x, -pockets[pIdx].y}; break; // أسفل
+                            case 1: mp = {pockets[pIdx].x, 134.6 * 2 - pockets[pIdx].y}; break; // أعلى
+                            case 2: mp = {-pockets[pIdx].x, pockets[pIdx].y}; break; // يسار
+                            case 3: mp = {261.6 * 2 - pockets[pIdx].x, pockets[pIdx].y}; break; // يمين
+                        }
+                        Point2D toMir = mp - ball.initialPosition;
+                        double distP = sqrt(toMir.square());
+                        if (distP > 0.1 && distP < 1000.0) {
+                            Point2D ghost = ball.initialPosition - (toMir * (1.0 / distP)) * (2.0 * BALL_RADIUS);
+                            Point2D shot = ghost - cueBall.initialPosition;
+                            double distC = sqrt(shot.square());
+                            double angle = atan2(shot.y, shot.x);
+                            
+                            // ضربات الارتداد تحتاج قوة أكبر لتعويض فقدان الطاقة عند الاصطدام بالحافة
+                            double basePower = CalculateRequiredPower(distC + distP) * 1.35; 
+                            double powerSteps[] = { basePower, basePower * 1.2 };
+                            for (double p : powerSteps) {
+                                double finalP = p;
+                                if (finalP > powerMax) finalP = powerMax;
+                                if (finalP < powerMin + 100) finalP = powerMin + 100;
+                                // إضافة عقوبة للسكور لأن الارتداد أصعب
+                                fs.raw.push_back({i, angle, 0, pIdx, finalP, distC + distP + 300.0});
+                            }
+                        }
+                    }
+                }
+
+                // 3. ضربات الكومبو (Combination Shots) - إضافة جديدة قوية
+                // (البحث عن ضرب كرة بكرة أخرى لإدخالها)
+                if (fs.prepPhase > 4) { // تنفيذها في المراحل المتأخرة لتوفير الأداء
+                    for (int j = 1; j < gPrediction->guiData.ballsCount; j++) {
+                        if (i == j) continue;
+                        auto& secondBall = gPrediction->guiData.balls[j];
+                        if (!secondBall.originalOnTable) continue;
+                        
+                        Point2D toPocket = pockets[pIdx] - secondBall.initialPosition;
+                        double d2P = sqrt(toPocket.square());
+                        if (d2P > 0.1 && d2P < 400.0) {
+                            Point2D ghost2 = secondBall.initialPosition - (toPocket * (1.0 / d2P)) * (2.0 * BALL_RADIUS);
+                            Point2D toGhost2 = ghost2 - ball.initialPosition;
+                            double d1toG2 = sqrt(toGhost2.square());
+                            if (d1toG2 > 0.1 && d1toG2 < 400.0) {
+                                Point2D ghost1 = ball.initialPosition - (toGhost2 * (1.0 / d1toG2)) * (2.0 * BALL_RADIUS);
+                                Point2D shot = ghost1 - cueBall.initialPosition;
+                                double angle = atan2(shot.y, shot.x);
+                                double power = CalculateRequiredPower(sqrt(shot.square()) + d1toG2 + d2P) * 1.2;
+                                fs.raw.push_back({j, angle, 0, pIdx, power, 1000.0}); // سكور منخفض كبداية
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        fs.prepPhase++;
+        if (fs.prepPhase == 8) {
+            // ترتيب المرشحين بناءً على المسافة الأقصر كبداية
+            std::sort(fs.raw.begin(), fs.raw.end());
+            // الاحتفاظ بأفضل 150 مرشح للتقييم الدقيق
+            if (fs.raw.size() > 150) fs.raw.resize(150);
+        }
+        return; 
+    }
+
+    // المرحلة الثانية: التقييم الدقيق عبر المحاكاة (Evaluation)
+    if (automationSpeed == SPEED_HUMAN && humanShotLocked) return;
+
+    auto myclass = sharedGameManager.getPlayerClassification();
+    int stepsInThisFrame = 0;
+    const int maxStepsPerFrame = 80; // سرعة تقييم عالية جداً
+
+    while (stepsInThisFrame < maxStepsPerFrame && fs.evalIndex < fs.raw.size()) {
+        const auto& r = fs.raw[fs.evalIndex++];
+        sweepAngle = r.angle;
+        stepsInThisFrame++;
+
+        // تنفيذ المحاكاة
+        gPrediction->forceFullSimulation = true; 
+        gPrediction->determineShotResult(true, r.angle, r.power, sharedGameManager.getShotSpin());
+        gPrediction->forceFullSimulation = false;
+        
+        bool validShot = true;
+        // 1. منع دخول الكرة البيضاء نهائياً
+        if (!gPrediction->guiData.balls[0].onTable) validShot = false;
+
+        // 2. منع دخول الكرة السوداء بالخطأ
+        if (validShot && myclass != Ball::Classification::EIGHT_BALL) {
+            if (!gPrediction->guiData.balls[8].onTable) validShot = false;
+        }
+
+        // 3. التحقق من أول اصطدام (قانونية الضربة)
+        if (validShot) {
+            auto firstHit = gPrediction->guiData.collision.firstHitBall;
+            if (!firstHit) validShot = false;
+            else {
+                if (myclass != Ball::Classification::ANY && myclass != Ball::Classification::EIGHT_BALL) {
+                    if (firstHit->classification != myclass) validShot = false;
+                } else if (myclass == Ball::Classification::EIGHT_BALL) {
+                    if (firstHit->index != 8) validShot = false;
+                }
+            }
+        }
+
+        if (validShot) {
+            int totPotted = 0, ownPotted = 0;
+            bool targetPotted = false;
+            
+            for (int i = 1; i < gPrediction->guiData.ballsCount; i++) {
+                auto& b = gPrediction->guiData.balls[i];
+                if (b.originalOnTable && !b.onTable) {
+                    totPotted++;
+                    if (i == r.idx) targetPotted = true;
+                    
+                    bool isOwn = false;
+                    if (myclass == Ball::Classification::ANY) isOwn = (i != 8);
+                    else if (myclass == Ball::Classification::EIGHT_BALL) isOwn = (i == 8);
+                    else isOwn = (b.classification == myclass);
+                    
+                    if (isOwn) ownPotted++;
+                }
+            }
+            
+            if (ownPotted > 0) {
+                // نظام نقاط متطور (Scoring System)
+                int score = (ownPotted * 5000); // الأولوية لعدد الكرات المدخلة
+                if (targetPotted) score += 1000; // بونص إذا دخلت الكرة المستهدفة
+                
+                // بونص لتمركز الكرة البيضاء بعد الضربة (Positioning)
+                // نفضل أن تنتهي الكرة البيضاء بعيداً عن الحواف وفي منتصف الطاولة
+                Point2D cbPos = gPrediction->guiData.balls[0].initialPosition;
+                double distToCenter = sqrt(cbPos.square());
+                score += (int)(200.0 - distToCenter);
+
+                // بونص لتفريق التجمعات (Cluster Breaking)
+                double clusterBefore = CalculateTableClusterScore(gPrediction->guiData); // يحتاج لدقة في البيانات الأصلية
+                // هنا يمكن إضافة منطق لمقارنة التجمعات قبل وبعد، لكن سنكتفي بتبسيطها
+                
+                Candidate cf = r; 
+                cf.score = (double)score;
+                fs.evals.push_back({cf, score, ownPotted, targetPotted && (r.idx == 9)});
+            }
+        }
+    }
+
+    // اختيار أفضل مرشح بعد انتهاء التقييم
+    if (fs.evalIndex >= fs.raw.size()) {
+        FastScanState::Eval* best = nullptr;
+        for (auto& ev : fs.evals) {
+            if (!best || ev.score > best->score) best = &ev;
+        }
+
+        if (best) {
+            fs.isInitiated = false;
+            g_CurrentCandidate = best->c;
+            Shoot(best->c.angle, best->c.power);
+        } else {
+            // إذا لم يجد مساراً، يحاول مرة أخرى ببيانات جديدة أو ينتقل للمسح البطيء
+            fs.isInitiated = false;
+            static int retryCount = 0;
+            if (++retryCount > 2) {
+                retryCount = 0;
+                scan = SLOW; 
+            }
+        }
+    }
+}

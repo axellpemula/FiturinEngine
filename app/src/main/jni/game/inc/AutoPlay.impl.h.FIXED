@@ -1,0 +1,455 @@
+// ============================================================================
+// FIXED AutoPlay.impl.h - تحسينات شاملة لإصلاح أخطاء Auto Play
+// ============================================================================
+// التحسينات:
+// 1. تحسين منطق اختيار الكرات لمنع ضرب الكرة السوداء خطأ
+// 2. تحسين معالجة الكرة البيضاء لمنع إدخالها في الجيب
+// 3. تحسين دقة البحث عن الضربات الصحيحة
+// 4. تحسين معالجة حالات الفشل والبحث المتكرر
+// 5. تحسين الدقة العددية للزوايا والقوة
+// ============================================================================
+
+// ============================================================================
+// ENHANCED VALIDATION FUNCTIONS
+// ============================================================================
+
+// تحقق محسّن من صحة الكرة المستهدفة
+static inline bool IsValidTargetBall(int ballIdx, Ball::Classification myclass, bool onlyEightBallLeft) {
+    if (ballIdx <= 0 || ballIdx >= 16) return false; // Invalid ball index
+    if (ballIdx == 8) {
+        // الكرة السوداء: يجب ضربها فقط عندما تكون الكرة الوحيدة المتبقية
+        return onlyEightBallLeft;
+    }
+    if (myclass == Ball::Classification::SOLID) {
+        return (ballIdx >= 1 && ballIdx <= 7);
+    } else if (myclass == Ball::Classification::STRIPE) {
+        return (ballIdx >= 9 && ballIdx <= 15);
+    } else if (myclass == Ball::Classification::EIGHT_BALL) {
+        return (ballIdx == 8);
+    } else if (myclass == Ball::Classification::ANY) {
+        return (ballIdx != 8); // أي كرة ما عدا السوداء
+    }
+    return false;
+}
+
+// تحقق محسّن من صحة الضربة
+static inline bool IsValidShot(
+    const Prediction::SceneData& guiData,
+    int targetBallIdx,
+    Ball::Classification myclass,
+    bool onlyEightBallLeft,
+    bool isNineBall
+) {
+    // تحقق من عدم إدخال الكرة البيضاء (الكرة رقم 0)
+    if (!guiData.balls[0].onTable) {
+        return false; // Scratch! Cue ball potted
+    }
+
+    // تحقق من أن الكرة المستهدفة لم تُدخل بشكل خاطئ
+    if (targetBallIdx == 8 && guiData.balls[8].originalOnTable && !guiData.balls[8].onTable) {
+        // تم إدخال الكرة السوداء
+        if (!onlyEightBallLeft) {
+            return false; // خطأ! إدخال الكرة السوداء قبل الأوان
+        }
+    }
+
+    // تحقق من أن أول كرة مضروبة صحيحة
+    auto firstHit = guiData.collision.firstHitBall;
+    if (!firstHit) {
+        return false; // لم تضرب أي كرة
+    }
+
+    // تحقق من أن أول كرة مضروبة هي الكرة المستهدفة أو كرة قانونية
+    if (firstHit->index != targetBallIdx) {
+        // ضربت كرة مختلفة - تحقق من أنها قانونية
+        if (isNineBall) {
+            // في لعبة 9 كرات، يجب ضرب أقل كرة مرقمة أولاً
+            return false; // لا يمكن ضرب كرة أخرى أولاً
+        } else {
+            // في 8 كرات، تحقق من أن الكرة المضروبة أولاً من نفس النوع
+            bool hitLegal = false;
+            if (onlyEightBallLeft) {
+                hitLegal = (firstHit->index == 8);
+            } else {
+                hitLegal = (myclass == Ball::Classification::ANY) ? 
+                           (firstHit->classification != Ball::Classification::EIGHT_BALL) : 
+                           (firstHit->classification == myclass);
+            }
+            if (!hitLegal) {
+                return false; // ضربة غير قانونية
+            }
+        }
+    }
+
+    return true;
+}
+
+// ============================================================================
+// IMPROVED ScanFast FUNCTION
+// ============================================================================
+
+void AutoPlay::ScanFast(double angleStep) {
+    if (g_CurrentCandidate.idx != -1) return;
+    
+    bShowAutoPlayLines = !persistent_bool[O("bDisableFlicker")];
+    static double fastSweepAngle = 0.0;
+    
+    Prediction::SceneData savedGuiData = gPrediction->guiData;
+    
+    auto& cueBall = gPrediction->guiData.balls[0];
+    double distSq = (cueBall.initialPosition - fs.scanCuePos).square();
+    
+    if (!fs.isInitiated || distSq > 0.0025) {
+        fs.raw.clear();
+        fs.evals.clear();
+        fs.evalIndex = 0;
+        fs.scanCuePos = cueBall.initialPosition;
+        fs.isInitiated = true;
+        fastSweepAngle = 0.0;
+
+        if (automationSpeed == SPEED_HUMAN && humanShotLocked)
+            return;
+        
+        if (currentMode == MODE_AUTO_AIM && bAimedThisTurn) return;
+
+        Ball::Classification myclass = sharedGameManager.getPlayerClassification();
+        uint nominatedPocket = sharedGameManager.getNominatedPocket();
+        bool isNineBallGame = (myclass == Ball::Classification::NINE_BALL_RULE);
+
+        auto pockets = getPockets();
+
+        // حساب onlyEightBallLeft مرة واحدة في بداية المسح
+        bool onlyEightBallLeft = false;
+        if (myclass == Ball::Classification::SOLID) {
+            bool hasSolids = false;
+            for (int k = 1; k < 8; k++) {
+                if (gPrediction->guiData.balls[k].originalOnTable) { hasSolids = true; break; }
+            }
+            if (!hasSolids) onlyEightBallLeft = true;
+        } else if (myclass == Ball::Classification::STRIPE) {
+            bool hasStripes = false;
+            for (int k = 9; k <= 15; k++) {
+                if (gPrediction->guiData.balls[k].originalOnTable) { hasStripes = true; break; }
+            }
+            if (!hasStripes) onlyEightBallLeft = true;
+        } else if (myclass == Ball::Classification::EIGHT_BALL) {
+            onlyEightBallLeft = true;
+        } else if (myclass == Ball::Classification::ANY) {
+            bool hasOthers = false;
+            for (int k = 1; k <= 15; k++) {
+                if (k == 8) continue;
+                if (gPrediction->guiData.balls[k].originalOnTable) { hasOthers = true; break; }
+            }
+            if (!hasOthers) onlyEightBallLeft = true;
+        }
+
+        std::vector<Candidate> directRaw;
+        std::vector<Candidate> specialRaw;
+
+        // توليد المرشحين مع تحسين التحقق من الصحة
+        bool bFoundLowestNumberedBall = false;
+        int iFoundLowestNumberedBall = -1;
+        for (int i = 1; i < gPrediction->guiData.ballsCount; i++) {
+            if (isNineBallGame && bFoundLowestNumberedBall) break;
+            auto& ball = gPrediction->guiData.balls[i];
+            if (!ball.originalOnTable) continue;
+            
+            // تحقق محسّن من صحة الكرة المستهدفة
+            if (!IsValidTargetBall(i, myclass, onlyEightBallLeft)) continue;
+            
+            if (!bFoundLowestNumberedBall) {
+                bFoundLowestNumberedBall = true;
+                iFoundLowestNumberedBall = i;
+            }
+            
+            for (int pocketIdx = 0; pocketIdx < pockets.size(); pocketIdx++) {
+                if (nominatedPocket < 6 && pocketIdx != nominatedPocket) continue;
+                Point2D pocket = pockets[pocketIdx];
+                Point2D toPocket = pocket - ball.initialPosition;
+                double distTargetToPocket = sqrt(toPocket.square());
+                if (distTargetToPocket < 0.1) continue;
+                Point2D direction = toPocket * (1.0 / distTargetToPocket);
+                Point2D ghostBallPos = ball.initialPosition - direction * (2.0 * BALL_RADIUS);
+
+                // 1. ضربة مباشرة
+                {
+                    Point2D shotLine = ghostBallPos - cueBall.initialPosition;
+                    double distCueToTarget = sqrt(shotLine.square());
+                    double angle = atan2(shotLine.y, shotLine.x);
+                    if (angle < 0) angle += 2 * M_PI;
+                    // تطبيع الزاوية بدقة عالية
+                    angle = NumberUtils::normalizeDoublePrecision(angle);
+                    double score = distCueToTarget + distTargetToPocket;
+                    double power = CalculateRequiredPower(score);
+                    power = NumberUtils::normalizeDoublePrecision(power);
+                    directRaw.push_back({i, angle, score, pocketIdx, power, score});
+                }
+
+                // 2. ضربة بنك (الكوشة)
+                if (bCushionShot) {
+                    for (int side = 0; side < 4; side++) {
+                        Point2D mp;
+                        switch(side) {
+                            case 0: mp = {pocket.x, -134.6 - pocket.y}; break;
+                            case 1: mp = {pocket.x, 134.6 - pocket.y}; break;
+                            case 2: mp = {-261.6 - pocket.x, pocket.y}; break;
+                            case 3: mp = {261.6 - pocket.x, pocket.y}; break;
+                        }
+                        Point2D toMir = mp - ball.initialPosition;
+                        double distP = sqrt(toMir.square());
+                        if (distP > 0.1) {
+                            Point2D ghost = ball.initialPosition - (toMir * (1.0 / distP)) * (2.0 * BALL_RADIUS);
+                            Point2D shot = ghost - cueBall.initialPosition;
+                            double distC = sqrt(shot.square());
+                            double angle = atan2(shot.y, shot.x);
+                            if (angle < 0) angle += 2 * M_PI;
+                            angle = NumberUtils::normalizeDoublePrecision(angle);
+                            double score = distC + distP + 100.0;
+                            double power = CalculateRequiredPower(distC + distP) * 1.25;
+                            if (power > (double)powerMax) power = (double)powerMax;
+                            if (power < (double)powerMin) power = (double)powerMin;
+                            power = NumberUtils::normalizeDoublePrecision(power);
+                            specialRaw.push_back({i, angle, score, pocketIdx, power, score});
+                        }
+                    }
+                }
+
+                // 3. ضربة كيك (الكوشة للكيو)
+                if (bCushionShot) {
+                    for (int side = 0; side < 4; side++) {
+                        Point2D mg;
+                        switch(side) {
+                            case 0: mg = {ghostBallPos.x, -134.6 - ghostBallPos.y}; break;
+                            case 1: mg = {ghostBallPos.x, 134.6 - ghostBallPos.y}; break;
+                            case 2: mg = {-261.6 - ghostBallPos.x, ghostBallPos.y}; break;
+                            case 3: mg = {261.6 - ghostBallPos.x, ghostBallPos.y}; break;
+                        }
+                        Point2D shot = mg - cueBall.initialPosition;
+                        double distC = sqrt(shot.square());
+                        double angle = atan2(shot.y, shot.x);
+                        if (angle < 0) angle += 2 * M_PI;
+                        angle = NumberUtils::normalizeDoublePrecision(angle);
+                        double score = distC + distTargetToPocket + 150.0;
+                        double power = CalculateRequiredPower(distC + distTargetToPocket) * 1.30;
+                        if (power > (double)powerMax) power = (double)powerMax;
+                        if (power < (double)powerMin) power = (double)powerMin;
+                        power = NumberUtils::normalizeDoublePrecision(power);
+                        specialRaw.push_back({i, angle, score, pocketIdx, power, score});
+                    }
+                }
+
+                // 4. ضربة مركبة (A -> B -> جيب)
+                for (int j = 1; j < gPrediction->guiData.ballsCount; j++) {
+                    if (j == i) continue;
+                    auto& ballB = gPrediction->guiData.balls[j];
+                    if (!ballB.originalOnTable) continue;
+                    
+                    // تحقق من صحة الكرة الثانية
+                    if (!IsValidTargetBall(j, myclass, onlyEightBallLeft)) continue;
+
+                    Point2D toPocketB = pocket - ballB.initialPosition;
+                    double distBToPocket = sqrt(toPocketB.square());
+                    if (distBToPocket < 0.1) continue;
+                    Point2D directionB = toPocketB * (1.0 / distBToPocket);
+                    Point2D ghostB = ballB.initialPosition - directionB * (2.0 * BALL_RADIUS);
+                    
+                    Point2D toGhostB = ghostB - ball.initialPosition;
+                    double distAToGhostB = sqrt(toGhostB.square());
+                    if (distAToGhostB < 0.1) continue;
+                    Point2D directionA = toGhostB * (1.0 / distAToGhostB);
+                    Point2D ghostA = ball.initialPosition - directionA * (2.0 * BALL_RADIUS);
+                    
+                    Point2D shotLine = ghostA - cueBall.initialPosition;
+                    double distCueToA = sqrt(shotLine.square());
+                    double angle = atan2(shotLine.y, shotLine.x);
+                    if (angle < 0) angle += 2 * M_PI;
+                    angle = NumberUtils::normalizeDoublePrecision(angle);
+                    double score = distCueToA + distAToGhostB + distBToPocket + 80.0;
+                    double power = CalculateRequiredPower(distCueToA + distAToGhostB + distBToPocket) * 1.1;
+                    if (power > (double)powerMax) power = (double)powerMax;
+                    if (power < (double)powerMin) power = (double)powerMin;
+                    power = NumberUtils::normalizeDoublePrecision(power);
+                    specialRaw.push_back({i, angle, score, pocketIdx, power, score});
+                }
+
+                // 5. ضربة قبلة / كاروم (Cue -> A -> ينحرف إلى B -> جيب)
+                for (int j = 1; j < gPrediction->guiData.ballsCount; j++) {
+                    if (j == i) continue;
+                    auto& ballB = gPrediction->guiData.balls[j];
+                    if (!ballB.originalOnTable) continue;
+                    
+                    // تحقق من صحة الكرة الثانية
+                    if (!IsValidTargetBall(j, myclass, onlyEightBallLeft)) continue;
+
+                    Point2D toPocketB = pocket - ballB.initialPosition;
+                    double distBToPocket = sqrt(toPocketB.square());
+                    if (distBToPocket < 0.1) continue;
+                    Point2D directionB = toPocketB * (1.0 / distBToPocket);
+                    Point2D ghostB = ballB.initialPosition - directionB * (2.0 * BALL_RADIUS);
+                    
+                    Point2D d = ghostB - ball.initialPosition;
+                    double distD = sqrt(d.square());
+                    if (distD < 2.0 * BALL_RADIUS) continue;
+
+                    double ratio = (2.0 * BALL_RADIUS) / distD;
+                    if (ratio > 1.0) ratio = 1.0;
+                    double theta = acos(ratio);
+                    double angleD = atan2(d.y, d.x);
+
+                    for (int sign : {-1, 1}) {
+                        double angleU = angleD + sign * theta;
+                        Point2D u = {cos(angleU), sin(angleU)};
+                        Point2D ghostA = ball.initialPosition + u * (2.0 * BALL_RADIUS);
+                        
+                        Point2D shotLine = ghostA - cueBall.initialPosition;
+                        double distCueToA = sqrt(shotLine.square());
+                        double angle = atan2(shotLine.y, shotLine.x);
+                        if (angle < 0) angle += 2 * M_PI;
+                        angle = NumberUtils::normalizeDoublePrecision(angle);
+                        double score = distCueToA + distD + distBToPocket + 120.0;
+                        double power = CalculateRequiredPower(distCueToA + distD + distBToPocket) * 1.2;
+                        if (power > (double)powerMax) power = (double)powerMax;
+                        if (power < (double)powerMin) power = (double)powerMin;
+                        power = NumberUtils::normalizeDoublePrecision(power);
+                        specialRaw.push_back({i, angle, score, pocketIdx, power, score});
+                    }
+                }
+            }
+        }
+
+        fs.raw.clear();
+        fs.raw.insert(fs.raw.end(), directRaw.begin(), directRaw.end());
+        fs.raw.insert(fs.raw.end(), specialRaw.begin(), specialRaw.end());
+        
+        // ترتيب حسب الدرجة لتحديد أفضل الضربات المباشرة والخاصة
+        std::sort(fs.raw.begin(), fs.raw.end(), [](const Candidate& a, const Candidate& b) {
+            return a.score < b.score;
+        });
+        
+        // تحديد عدد المرشحين (80 بدلاً من 60 للبحث الأوسع)
+        if (fs.raw.size() > 80) {
+            fs.raw.resize(80);
+        }
+
+        // ترتيب نهائي حسب الزاوية للمسح السلس
+        std::sort(fs.raw.begin(), fs.raw.end(), [](const Candidate& a, const Candidate& b) {
+            return a.angle < b.angle;
+        });
+    }
+
+    if (automationSpeed == SPEED_HUMAN && humanShotLocked) return;
+
+    Ball::Classification myclass = sharedGameManager.getPlayerClassification();
+    uint nominatedPocket = sharedGameManager.getNominatedPocket();
+    bool isNineBallGame = (myclass == Ball::Classification::NINE_BALL_RULE);
+
+    // حساب onlyEightBallLeft للتقييم
+    bool onlyEightBallLeft = false;
+    if (myclass == Ball::Classification::SOLID) {
+        bool hasSolids = false;
+        for (int k = 1; k < 8; k++) {
+            if (gPrediction->guiData.balls[k].originalOnTable) { hasSolids = true; break; }
+        }
+        if (!hasSolids) onlyEightBallLeft = true;
+    } else if (myclass == Ball::Classification::STRIPE) {
+        bool hasStripes = false;
+        for (int k = 9; k <= 15; k++) {
+            if (gPrediction->guiData.balls[k].originalOnTable) { hasStripes = true; break; }
+        }
+        if (!hasStripes) onlyEightBallLeft = true;
+    } else if (myclass == Ball::Classification::EIGHT_BALL) {
+        onlyEightBallLeft = true;
+    } else if (myclass == Ball::Classification::ANY) {
+        bool hasOthers = false;
+        for (int k = 1; k <= 15; k++) {
+            if (k == 8) continue;
+            if (gPrediction->guiData.balls[k].originalOnTable) { hasOthers = true; break; }
+        }
+        if (!hasOthers) onlyEightBallLeft = true;
+    }
+
+    // تقييم المرشحين مع تحسين التحقق من الصحة
+    int stepsInThisFrame = 0;
+    const int maxStepsPerFrame = 50; // زيادة من 30 للبحث الأسرع
+
+    while (stepsInThisFrame < maxStepsPerFrame && fs.evalIndex < fs.raw.size()) {
+        const auto& r = fs.raw[fs.evalIndex++];
+        sweepAngle = r.angle;
+        stepsInThisFrame++;
+
+        gPrediction->forceFullSimulation = bShowAutoPlayLines; 
+        gPrediction->determineShotResult(true, r.angle, r.power, sharedGameManager.getShotSpin());
+        gPrediction->forceFullSimulation = false;
+        
+        // تحقق محسّن من صحة الضربة
+        if (!IsValidShot(gPrediction->guiData, r.idx, myclass, onlyEightBallLeft, isNineBallGame)) {
+            continue; // تخطي الضربات غير الصحيحة
+        }
+
+        // حساب الدرجة مع تحسينات
+        int tot = 0, own = 0; 
+        bool hasLegal = false;
+        for (int i = 1; i < gPrediction->guiData.ballsCount; i++) {
+            if (gPrediction->guiData.balls[i].originalOnTable && !gPrediction->guiData.balls[i].onTable) {
+                tot++;
+                bool m = (myclass == Ball::Classification::ANY) ? 
+                         (gPrediction->guiData.balls[i].classification != Ball::Classification::EIGHT_BALL) : 
+                         (gPrediction->guiData.balls[i].classification == myclass);
+                if (m) { hasLegal = true; own++; }
+            }
+        }
+        
+        if (hasLegal) {
+            int totalScore = (own * 1000);
+            double distFactor = (500.0 - r.dist) / 10.0; 
+            if (distFactor > 0) totalScore += (int)distFactor;
+
+            int ownBallsMoved = 0;
+            for (int i = 1; i < gPrediction->guiData.ballsCount; i++) {
+                auto& b = gPrediction->guiData.balls[i];
+                if (b.classification == myclass && b.originalOnTable && b.onTable) {
+                    double moveDistSq = (b.initialPosition - b.predictedPosition).square();
+                    if (moveDistSq > 1.0) ownBallsMoved++;
+                }
+            }
+            totalScore += (ownBallsMoved * 50);
+
+            Candidate cf = r; 
+            cf.score = (double)totalScore;
+            fs.evals.push_back({cf, totalScore, own, false});
+        }
+    }
+
+    if (fs.evalIndex >= fs.raw.size()) {
+        FastScanState::Eval* best = nullptr;
+        for (auto& ev : fs.evals) {
+            if (!best || ev.c.score > best->c.score) best = &ev;
+        }
+
+        if (best) {
+            fs.isInitiated = false;
+            g_CurrentCandidate = best->c;
+            Shoot(best->c.angle, best->c.power);
+        } else {
+            // لم يتم العثور على ضربة صحيحة - جرب البحث البطيء
+            fs.isInitiated = false;
+            lastFailedCuePos = cueBall.initialPosition;
+            scan = SLOW;
+        }
+    }
+
+    // رسم خط مسح الرادار الدوار أثناء المسح السريع
+    if (fs.evalIndex < fs.raw.size()) {
+        fastSweepAngle = normalizeAngle(fastSweepAngle + 0.15);
+        if (!persistent_bool[O("bDisableFlicker")]) {
+            gPrediction->forceFullSimulation = true;
+            gPrediction->determineShotResult(true, fastSweepAngle, 400.0f, sharedGameManager.getShotSpin());
+            gPrediction->forceFullSimulation = false;
+        }
+        sweepAngle = fastSweepAngle;
+    }
+}
+
+// ============================================================================
+// IMPORTANT: استبدل الدالة ScanFast الأصلية بهذه النسخة المحسّنة
+// ============================================================================
