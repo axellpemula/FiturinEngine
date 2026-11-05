@@ -73,12 +73,14 @@ inline void SetToast(const std::string& msg, bool success) {
     }
 }
 
-inline void FillCache(bool valid, int64_t expiredEpoch, int64_t verifiedAt, const std::string& key) {
+inline void FillCache(bool valid, int64_t expiredEpoch, int64_t verifiedAt, const std::string& key,
+                      const std::string& secret = "") {
     CachedLicense& c = Cache();
     c.valid = valid;
     c.expiredEpoch = expiredEpoch;
     c.verifiedAt = verifiedAt;
     c.key = key;
+    c.secret = secret;      // hanya di memori, tidak pernah ditulis ke disk
 }
 
 inline void ApplyResult(const Result& r, bool silent) {
@@ -96,7 +98,7 @@ inline void ApplyResult(const Result& r, bool silent) {
         g_auth.reseller = r.reseller;
         g_auth.keyInput = r.key;
         g_auth.toastTimer = 0.0f;                 // kartu menutup sendiri, tak perlu toast
-        FillCache(true, r.expiredEpoch, (int64_t)time(nullptr), r.key);
+        FillCache(true, r.expiredEpoch, (int64_t)time(nullptr), r.key, r.secret);
     } else {
         g_auth.message = r.message;
         FillCache(false, 0, 0, "");
@@ -272,6 +274,10 @@ inline bool RequireLicense(const char* where = "") {
     }
     return true;
 }
+
+// Nilai ini hanya hidup di RAM selama proses berjalan (boleh dipakai bagian
+// tool yang butuh config/kunci dari panel, jangan ditulis ke storage).
+inline std::string SecretPayload() { return Cache().secret; }
 
 inline bool IsLoggedIn() { return g_auth.loggedIn; }
 inline std::string CurrentKey() { return g_auth.keyInput; }

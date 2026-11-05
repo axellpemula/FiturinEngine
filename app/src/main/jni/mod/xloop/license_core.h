@@ -38,23 +38,29 @@
 extern "C" int sha512(const unsigned char* message, size_t message_len, unsigned char* out);
 
 // ============================ KONFIGURASI ============================
-// Ganti 4 nilai di bawah ini sesuai panel kamu (halaman Tool Management).
+// Nilai di bawah ini sudah diisi untuk panel produksi:
+//   https://xlooppanelid.vercel.app  |  tool: fiturin8bp  |  version: 1.0.0
+// Kalau panel pindah domain / ganti tool / ganti keypair, cukup ubah di sini.
 // Tool slug & version harus sama persis dengan yang terdaftar di panel,
 // kalau beda server akan menjawab "wrong_tool" / "wrong_version".
 // =====================================================================
 #ifndef XLOOP_PANEL_URL
-#define XLOOP_PANEL_URL   "https://panel.xloop.dev"
+#define XLOOP_PANEL_URL   "https://xlooppanelid.vercel.app"
 #endif
 #ifndef XLOOP_TOOL_SLUG
-#define XLOOP_TOOL_SLUG   "fiturinengine"
+#define XLOOP_TOOL_SLUG   "fiturin8bp"
 #endif
 #ifndef XLOOP_TOOL_VERSION
 #define XLOOP_TOOL_VERSION "1.0.0"
 #endif
-// Public key Ed25519 (base64, 32 byte) dari panel -> Tool Management -> Public key.
-// WAJIB diganti: selama masih placeholder semua validasi akan ditolak.
+// Public key Ed25519 milik panel (Tool Management -> public key verifikasi).
+// Format PEM (SPKI) diterima apa adanya oleh ParsePublicKey(); bisa juga
+// diganti base64 32 byte atau hex 64 karakter.
 #ifndef XLOOP_PUBLIC_KEY_B64
-#define XLOOP_PUBLIC_KEY_B64 ""
+#define XLOOP_PUBLIC_KEY_B64 \
+    "-----BEGIN PUBLIC KEY-----\n" \
+    "MCowBQYDK2VwAyEAKgIC1sJK8ls/kT0dYZTpJkHb6Imjp0knnY/mn6FkOb4=\n" \
+    "-----END PUBLIC KEY-----\n"
 #endif
 
 namespace xloop {
@@ -456,6 +462,7 @@ struct CachedLicense {
     int64_t expiredEpoch = 0;
     int64_t verifiedAt   = 0;
     std::string key;
+    std::string secret;     // config/kunci dari panel, hanya di RAM
 };
 inline CachedLicense& Cache() {
     static CachedLicense c;
@@ -464,6 +471,7 @@ inline CachedLicense& Cache() {
 
 inline void ClearSession() {
     remove(SessionPath().c_str());
+    Cache().secret.clear();
 }
 
 // Server menandai device lewat register_device(); kalau HWID berubah
@@ -528,6 +536,7 @@ struct Result {
     int64_t expiredEpoch = 0;   // 0 = lifetime
     int maxDevice = 0;
     int currentDevices = 0;
+    std::string secret;         // secret_payload dari panel (hanya di memori)
     bool cached = false;        // true kalau hasil dari session offline
 };
 
@@ -744,6 +753,7 @@ inline Result VerifyServerResponseEx(const std::string& responseBody, const std:
     }
     if (r.expiredAt.empty()) r.expiredEpoch = 0;
 
+    r.secret = JsonStr(payload, "secret_payload");
     r.maxDevice = (int)JsonInt(payload, "max_device");
     r.currentDevices = (int)JsonInt(payload, "current_devices");
     r.reseller = JsonStr(payload, "reseller");

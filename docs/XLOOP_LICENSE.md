@@ -25,30 +25,27 @@ Referensi: `axellpemula/XLOOP-PANEL` → `app/api/validate/route.ts`,
 
 ---
 
-## 2. Konfigurasi wajib (4 nilai)
+## 2. Konfigurasi (sudah diisi untuk panel produksi)
 
 Semua di bagian atas `jni/mod/xloop/license_core.h`:
 
 ```cpp
-#define XLOOP_PANEL_URL     "https://panel.xloop.dev"   // domain panel kamu
-#define XLOOP_TOOL_SLUG     "fiturinengine"             // harus sama dengan slug di panel
-#define XLOOP_TOOL_VERSION  "1.0.0"                     // harus sama dengan nama version di panel
-#define XLOOP_PUBLIC_KEY_B64 ""                          // WAJIB diisi
+#define XLOOP_PANEL_URL     "https://xlooppanelid.vercel.app"
+#define XLOOP_TOOL_SLUG     "fiturin8bp"
+#define XLOOP_TOOL_VERSION  "1.0.0"
+#define XLOOP_PUBLIC_KEY_B64 \
+    "-----BEGIN PUBLIC KEY-----\n" \
+    "MCowBQYDK2VwAyEAKgIC1sJK8ls/kT0dYZTpJkHb6Imjp0knnY/mn6FkOb4=\n" \
+    "-----END PUBLIC KEY-----\n"
 ```
 
-`XLOOP_PUBLIC_KEY_B64` menerima tiga format, pilih salah satu:
+Nilai `XLOOP_PUBLIC_KEY_B64` juga menerima **base64 32 byte mentah** atau **hex 64 karakter**
+(kalau lebih suka format ringkas). Ketiga format diurai oleh `ParsePublicKey()`; key panel di atas
+sudah diverifikasi ter-parse menjadi 32 byte dan cocok dengan slug `fiturin8bp`.
 
-1. **base64 32 byte mentah** (paling ringkas) — hasil ekstrak dari PEM
-2. **hex 64 karakter**
-3. **PEM penuh** `-----BEGIN PUBLIC KEY----- … -----END PUBLIC KEY-----`
-
-Ambil dari panel: **Tool Management → kotak public key verifikasi → tombol copy**.
-Selama masih kosong, semua percobaan aktivasi ditolak lebih awal dengan pesan
-`Ed25519 public key is not configured in build` (tidak ada request keluar).
-
-> Ganti keypair di panel = semua build lama harus di-update public key-nya.
-
----
+Kalau panel pindah domain / ganti tool / ganti keypair, cukup ubah 4 nilai ini — tidak ada
+tempat lain yang perlu disentuh. **Ganti keypair di panel = semua build lama harus di-update
+public key-nya.**
 
 ## 3. Alur validasi (sama persis dengan docs panel)
 
@@ -58,7 +55,7 @@ Selama masih kosong, semua percobaan aktivasi ditolak lebih awal dengan pesan
    ```json
    {
      "key": "XLVP-AB12-CD34",
-     "tool_slug": "fiturinengine",
+     "tool_slug": "fiturin8bp",
      "tool_version": "1.0.0",
      "hardware_id": "android:<sha512-64-hex>",
      "nonce": "<32 char>"
@@ -71,7 +68,8 @@ Selama masih kosong, semua percobaan aktivasi ditolak lebih awal dengan pesan
    sebelum verifikasi, karena urutan key/whitespace bisa berubah dan signature jadi tidak valid).
 5. Cek isi payload: `valid === true`, `nonce` sama dengan yang dikirim, `hardware_id` sama,
    `tool`/`version` cocok, dan `expired_at` masih berlaku.
-6. `secret_payload` hanya disimpan di memori proses (tidak ditulis ke disk, tidak di-log).
+6. `secret_payload` hanya disimpan di memori proses (tidak ditulis ke disk, tidak di-log),
+   bisa dibaca lewat `xloop::SecretPayload()` untuk bagian tool yang butuh config/kunci panel.
 
 Semua langkah di atas ada di `xloop::VerifyServerResponseEx()` / `xloop::VerifyKey()`, lalu dipakai
 ulang oleh gate fitur.
@@ -156,7 +154,7 @@ const { publicKey, privateKey } = generateKeyPairSync("ed25519");
 const raw = publicKey.export({ type: "spki", format: "der" }).subarray(12); // 32 byte
 
 const payload = JSON.stringify({
-  valid: true, tool: "fiturinengine", version: "1.0.0",
+  valid: true, tool: "fiturin8bp", version: "1.0.0",
   expired_at: "2030-01-01T00:00:00.000Z", max_device: 2, current_devices: 1,
   hardware_id: "<HWID dari baris DEVICE>", nonce: "<nonce yang dikirim>",
   server_time: new Date().toISOString(), secret_payload: null
@@ -188,6 +186,7 @@ key expired, key banned, public key kosong/rusak, public key format PEM/hex.
 | `Cannot reach license server` | jaringan / URL salah | cek `XLOOP_PANEL_URL` |
 | `License signature is invalid` | public key build ≠ keypair panel | salin ulang public key |
 | `Ed25519 public key is not configured` | `XLOOP_PUBLIC_KEY_B64` kosong | isi dulu |
+| `Request rejected by server (…invalid_request)` | body ditolak panel (mis. slug/version kosong) | cek `tool_slug`/`tool_version` |
 
 ---
 
